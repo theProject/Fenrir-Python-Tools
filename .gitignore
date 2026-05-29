@@ -10,3 +10,8 @@ venv/
 # Tool outputs
 *.csv
 *.vcf
+
+# Local task/instruction files
+AGENTS.md
+TASK.md
+TASK2.md

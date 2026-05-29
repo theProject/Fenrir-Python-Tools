@@ -10,6 +10,7 @@ from tools.note_parser import extract_notes
 from tools.calendar_parser import extract_calendar
 from tools.password_rescue import probe_password_artifacts
 from tools.report_generator import build_report
+from tools.forensic_backup import add_forensic_parser, run_forensic_triage
 
 def main():
     parser = argparse.ArgumentParser(prog="iOS Rescue Tools", description="Extract • Decode • Recover")
@@ -57,6 +58,8 @@ def main():
     p_rp.add_argument("--source", required=True, help="Root folder where module exports live")
     p_rp.add_argument("--output", "-o", default="./rescue/summary.html")
 
+    add_forensic_parser(sub)
+
     args = parser.parse_args()
 
     if args.cmd == "analyze":
@@ -89,6 +92,10 @@ def main():
 
     if args.cmd == "report":
         build_report(normalize_path(args.source), normalize_path(args.output))
+        return
+
+    if args.cmd == "forensics":
+        run_forensic_triage(args)
         return
 
 if __name__ == "__main__":

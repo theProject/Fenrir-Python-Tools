@@ -2,6 +2,10 @@
 rich>=13.7.0
 tqdm>=4.66.0
 pandas>=2.2.0
+iphone-backup-decrypt>=0.9.0
+cryptography>=42.0.0
+pycryptodome>=3.20.0
+pytest>=8.0.0
 # Media / EXIF (optional but recommended)
 Pillow>=10.0.0
 exifread>=3.0.0
