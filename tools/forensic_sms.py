@@ -164,13 +164,16 @@ def parse_sms_exports(sms_db: Path, output: Path, warnings: list[str]) -> dict[s
         write_csv(output / "sms_messages.csv", messages)
         write_json(output / "sms_messages.json", messages)
 
-        # === Always with Love ===
-        title = (
-            'Apple SMS/MMS/RCS/iMessage Defeated '
-            '<span style="color:#000000; -webkit-text-stroke: 2px #e20074;">💔</span> '
-            'by <span style="color:#e20074; font-weight:bold;">okayhacker</span>'
-        )
-        write_table_html(output / "sms_messages.html", title, messages)
+        # === okayhacker wins ===
+        write_table_html(output / "sms_messages.html", "Apple iMessage History Decrypted", messages)
+
+        # === Quick & Dirty Signature Injection With Love from okayhacker ===
+        html_path = output / "sms_messages.html"
+        content = html_path.read_text(encoding="utf-8")
+        styled = 'Apple iMessage History Decrypted <span style="color:#000000; -webkit-text-stroke: 3px #05f2af;"> ⛓️‍💥 </span> by <span style="color:#e20074; font-weight:bold;">okayhacker</span>'
+        content = content.replace("<h1>Apple iMessage History Decrypted</h1>", f"<h1>{styled}</h1>")
+        html_path.write_text(content, encoding="utf-8")
+        
         write_csv(output / "sms_chats.csv", chat_rows)
         write_csv(output / "sms_handles.csv", handle_rows)
         write_csv(output / "sms_attachments.csv", attachments)
