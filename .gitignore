@@ -1,19 +1,61 @@
-﻿# Python
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments / local env
 .venv/
 venv/
+env/
 .env
+.env.*
+!.env.example
 
-# Tool outputs
-*.csv
-*.vcf
+# macOS / editor junk
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/
 
 # Local task/instruction files
 AGENTS.md
 TASK.md
 TASK2.md
-.DS_Store
-**/.DS_Store
+
+# Forensic outputs / recovered evidence
+rescue/
+Forensics/
+iOS_Recovery_Outputs/
+iOS_Backup_Copies/
+*_Recovery_Outputs/
+*_Backup_Copies/
+
+# Extracted iOS backup artefacts / databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.plist.json
+
+# Generated forensic reports and exports
+*.csv
+*.vcf
+*.html
+*.json
+
+# But allow project config JSON if you ever add it intentionally
+!package.json
+!package-lock.json
+!pnpm-lock.yaml
+!tsconfig.json
+!biome.json
+!ruff.toml
