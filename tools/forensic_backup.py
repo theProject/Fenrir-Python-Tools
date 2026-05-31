@@ -9,6 +9,7 @@ import plistlib
 import re
 import shutil
 import sqlite3
+import warnings as py_warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,7 @@ class BackupExtractor:
         self.manifest_plist = _read_plist(source / "Manifest.plist")
         self.encrypted = bool(self.manifest_plist.get("IsEncrypted", False))
         self._encrypted_backup: Any | None = None
+        self._extraction_cache: dict[str, ExtractedArtifact] = {}
         if self.encrypted:
             if not password:
                 raise ForensicError("This backup is encrypted. Use --password-env IOS_BACKUP_PASSWORD, --prompt-password, or --password.")
@@ -156,19 +158,41 @@ class BackupExtractor:
             return fallback, note
 
     def extract_record(self, record: ManifestRecord, output_path: Path, label: str = "artifact") -> ExtractedArtifact:
+        cache_key = record.file_id or record.logical_path
+        cached = self._extraction_cache.get(cache_key)
+        if cached and cached.extracted and Path(cached.output_path).exists():
+            return ExtractedArtifact(
+                label=label,
+                file_id=record.file_id,
+                domain=record.domain,
+                relative_path=record.relative_path,
+                logical_path=record.logical_path,
+                source_path=cached.source_path,
+                output_path=cached.output_path,
+                source_sha256=cached.source_sha256,
+                output_sha256=cached.output_sha256,
+                output_size=cached.output_size,
+                encrypted=self.encrypted,
+                extracted=True,
+                notes=f"Reused previously extracted artefact from {cached.label}; no duplicate copy made.",
+            )
         requested_path = output_path
         output_path, collision_note = self._prepare_output_path(record, requested_path, label)
         source_obj = self.source_object_path(record.file_id)
         source_hash = sha256_file(source_obj) if source_obj and source_obj.exists() else None
         try:
-            if self.encrypted:
-                encrypted_extract_file(self._encrypted_backup, record, output_path)
-            else:
-                if not source_obj:
-                    raise FileNotFoundError(record.file_id)
-                shutil.copy2(source_obj, output_path)
+            with py_warnings.catch_warnings(record=True) as caught_warnings:
+                py_warnings.simplefilter("always")
+                if self.encrypted:
+                    encrypted_extract_file(self._encrypted_backup, record, output_path)
+                else:
+                    if not source_obj:
+                        raise FileNotFoundError(record.file_id)
+                    shutil.copy2(source_obj, output_path)
             output_hash = sha256_file(output_path)
-            return ExtractedArtifact(
+            warning_notes = [f"Extractor warning: {str(item.message)}" for item in caught_warnings]
+            notes = " | ".join(part for part in [collision_note, *warning_notes] if part)
+            artifact = ExtractedArtifact(
                 label=label,
                 file_id=record.file_id,
                 domain=record.domain,
@@ -181,8 +205,10 @@ class BackupExtractor:
                 output_size=output_path.stat().st_size,
                 encrypted=self.encrypted,
                 extracted=True,
-                notes=collision_note,
+                notes=notes,
             )
+            self._extraction_cache[cache_key] = artifact
+            return artifact
         except Exception as exc:
             return ExtractedArtifact(
                 label=label,
@@ -355,7 +381,35 @@ def _hit_sources(output: Path) -> list[Path]:
         output / "system_artifacts" / "raw_string_hits.json",
         output / "system_artifacts" / "sqlite_raw_hits.json",
         output / "microsoft_coredata" / "person_hits.json",
+        output / "microsoft_coredata" / "related_rows.json",
     ]
+
+
+FOCUSED_REVIEW_SOURCES = {
+    "microsoft_coredata_person_hits": ("Microsoft CoreData person rows are entity records, not messages.", ("microsoft_coredata", "person_hits.json")),
+    "microsoft_coredata_related_rows": ("Microsoft CoreData related rows are entity/relationship records, not messages.", ("microsoft_coredata", "related_rows.json")),
+    "notifications": ("Notification hits are notification fragments, not full app message recovery.", ("system_artifacts", "notification_keyword_hits.json")),
+    "outlook": ("Outlook hits are local cache artefacts unless a table/column proves message content.", ("system_artifacts", "outlook_keyword_hits.json")),
+    "tesla_app_traces": ("Tesla app traces are local app artefacts and should be interpreted by source path, table, and snippet quality.", ("system_artifacts", "tesla_app_keyword_hits.json")),
+}
+
+
+def _with_focus(rows: list[dict[str, Any]], focus: str, note: str) -> list[dict[str, Any]]:
+    return [{**row, "focused_export": focus, "professional_evidence_note": note} for row in rows]
+
+
+def _summary_key(row: dict[str, Any], summary_name: str) -> str:
+    if summary_name == "app_domain":
+        return str(row.get("app_guess") or row.get("app_or_domain") or row.get("domain") or "unknown")
+    return str(row.get(summary_name) or "unknown")
+
+
+def _write_summary_table(review_dir: Path, stem: str, rows: list[dict[str, Any]], summary_name: str, title: str) -> None:
+    counts: Counter[str] = Counter(_summary_key(row, summary_name) for row in rows)
+    data = [{"value": key, "hits": count} for key, count in counts.most_common()]
+    write_csv(review_dir / f"{stem}_by_{summary_name}.csv", data)
+    write_json(review_dir / f"{stem}_by_{summary_name}.json", data)
+    write_table_html(review_dir / f"{stem}_by_{summary_name}.html", title, data)
 
 
 def write_review_exports(output: Path, compound_keywords: list[str] | None = None, compound_window: int = 500) -> dict[str, int]:
@@ -394,7 +448,37 @@ def write_review_exports(output: Path, compound_keywords: list[str] | None = Non
     write_csv(review_dir / "compound_keyword_hits.csv", compound_rows)
     write_json(review_dir / "compound_keyword_hits.json", compound_rows)
     write_cards_html(review_dir / "compound_keyword_hits.html", "Compound Keyword Hits", compound_rows)
-    return {"high_signal_hits": len(high_signal), "reviewed_hits": len(hits), "compound_keyword_hits": len(compound_rows)}
+    focused_rows = _with_focus(
+        compound_rows,
+        "compound_keyword_hits",
+        "Compound keyword hits show multiple configured terms within the review window; inspect source path and evidence class before drawing conclusions.",
+    )
+    write_csv(review_dir / "focused_compound_keyword_hits.csv", focused_rows)
+    write_json(review_dir / "focused_compound_keyword_hits.json", focused_rows)
+    write_cards_html(review_dir / "focused_compound_keyword_hits.html", "Focused Compound Keyword Hits", focused_rows)
+    for focus, (note, path_parts) in FOCUSED_REVIEW_SOURCES.items():
+        rows = _with_focus(plist_safe_json(output.joinpath(*path_parts)), focus, note)
+        focused_rows.extend(rows)
+        write_csv(review_dir / f"focused_{focus}.csv", rows)
+        write_json(review_dir / f"focused_{focus}.json", rows)
+        write_cards_html(review_dir / f"focused_{focus}.html", f"Focused {focus.replace('_', ' ').title()}", rows)
+    write_csv(review_dir / "focused_review_hits.csv", focused_rows)
+    write_json(review_dir / "focused_review_hits.json", focused_rows)
+    write_cards_html(review_dir / "focused_review_hits.html", "Focused Review Hits", focused_rows)
+    for summary_name, title in (
+        ("keyword", "Focused Review Summary By Keyword"),
+        ("app_domain", "Focused Review Summary By App / Domain"),
+        ("evidence_class", "Focused Review Summary By Evidence Class"),
+        ("table", "Focused Review Summary By Table"),
+        ("logical_path", "Focused Review Summary By Logical Path"),
+    ):
+        _write_summary_table(review_dir, "focused_summary", focused_rows, summary_name, title)
+    return {
+        "high_signal_hits": len(high_signal),
+        "reviewed_hits": len(hits),
+        "focused_review_hits": len(focused_rows),
+        "compound_keyword_hits": len(compound_rows),
+    }
 
 
 def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
@@ -522,6 +606,7 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
             "deep_scan_sqlite_row_limit": deep_result.get("sqlite_row_limit", args.deep_scan_sqlite_row_limit),
             "deep_scan_export_context": deep_result.get("export_context", args.deep_scan_export_context),
             "high_signal_hits": review_result.get("high_signal_hits", 0),
+            "focused_review_hits": review_result.get("focused_review_hits", 0),
             "notification_hits": system_result.get("notification_hits", 0),
             "mail_hits": system_result.get("mail_hits", 0),
             "outlook_hits": system_result.get("outlook_hits", 0),
@@ -533,6 +618,13 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
             "raw_string_hits": system_result.get("raw_string_hits", 0),
             "sqlite_raw_hits": system_result.get("sqlite_raw_hits", 0),
             "compound_keyword_hits": review_result.get("compound_keyword_hits", system_result.get("compound_keyword_hits", 0)),
+            "system_reused_files": system_result.get("reused_files", 0),
+            "system_classified_warnings": system_result.get("classified_warnings", 0),
+            "decrypt_size_mismatch_warnings": system_result.get("decrypt_size_mismatch_warnings", 0),
+            "system_sqlite_integrity_checked": system_result.get("sqlite_integrity_checked", 0),
+            "system_sqlite_integrity_ok": system_result.get("sqlite_integrity_ok", 0),
+            "system_sqlite_integrity_warnings": system_result.get("sqlite_integrity_warnings", 0),
+            "system_sqlite_integrity_errors": system_result.get("sqlite_integrity_errors", 0),
             "directory_records_skipped": teams_result.get("directory_records_skipped", 0) + deep_result.get("directory_records_skipped", 0) + system_result.get("directory_records_skipped", 0),
             "extraction_failures": teams_result.get("extraction_failures", 0) + deep_result.get("extraction_failures", 0) + system_result.get("extraction_failures", 0),
         },
@@ -541,6 +633,9 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
             "Original backup was not modified.",
             "Encrypted artefacts were decrypted into the output folder only.",
             "Microsoft Teams is cloud-backed; absence of local message bodies does not prove messages never existed server-side.",
+            "Microsoft CoreData rows are entity/relationship records, not messages unless a source schema clearly proves message content.",
+            "Raw string hits are fragment-level evidence; SQLite raw byte hits are not deleted-row recovery unless independently proven.",
+            "Decrypt-size mismatch is warning-level until SQLite integrity checks or parser failures prove an extraction failure.",
         ],
     }
     write_case_summary(output / "case_summary.json", output / "case_summary.html", summary)

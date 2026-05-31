@@ -1,11 +1,14 @@
+import csv
 import json
 import plistlib
 import sqlite3
 from pathlib import Path
 
-from tools.forensic_backup import BackupExtractor, add_forensic_parser, run_forensic_triage
+from tools.forensic_backup import BackupExtractor, add_forensic_parser, run_forensic_triage, write_review_exports
+from tools.forensic_common import classify_warning_message
 from tools.forensic_models import ManifestRecord
-from tools.forensic_system_artifacts import compound_keyword_hits, run_system_artifacts
+from tools.forensic_sms import extract_sms_artifacts
+from tools.forensic_system_artifacts import compound_keyword_hits, run_system_artifacts, sqlite_integrity_check
 
 
 def _backup(tmp_path: Path) -> Path:
@@ -265,3 +268,215 @@ def test_forensics_e2e_writes_system_counts_to_case_summary(tmp_path):
     summary = json.loads((output / "case_summary.json").read_text(encoding="utf-8"))
     assert summary["results"]["notification_hits"] == 1
     assert summary["results"]["compound_keyword_hits"] == 1
+
+
+def test_milestone_2_1_warning_classification_distinguishes_decrypt_size_mismatch():
+    mismatch = classify_warning_message("Size of decrypted file does not match expected size")
+    failure = classify_warning_message("Could not extract system artefact HomeDomain/file.db: no such file")
+
+    assert mismatch["warning_category"] == "decrypt_size_mismatch"
+    assert mismatch["warning_severity"] == "warning"
+    assert "warning-level" in mismatch["professional_note"]
+    assert failure["warning_category"] == "extraction_failure"
+    assert failure["warning_severity"] == "error"
+
+
+def test_milestone_2_1_system_sqlite_integrity_report_generation(tmp_path):
+    backup = _backup(tmp_path)
+    db = tmp_path / "notification.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE notifications (body TEXT)")
+    conn.execute("INSERT INTO notifications VALUES ('Tesla notification row')")
+    conn.commit()
+    conn.close()
+    _object(backup, "99000001", db.read_bytes())
+    record = _record("99000001", "HomeDomain", "Library/UserNotifications/notifications.sqlite")
+    direct = sqlite_integrity_check(db, record)
+    records = {"_backup": backup, "notification": record}
+
+    output, warnings, result = _run(tmp_path, records, ["Tesla"], {"notification_scan": True})
+
+    assert direct["integrity_status"] == "ok"
+    assert warnings == []
+    assert result["sqlite_integrity_checked"] == 1
+    assert result["sqlite_integrity_ok"] == 1
+    integrity_csv = (output / "system_artifacts" / "sqlite_integrity_checks.csv").read_text(encoding="utf-8")
+    assert "integrity_status" in integrity_csv
+    assert "ok" in integrity_csv
+
+
+def test_milestone_2_1_focused_review_exports_and_summary_tables(tmp_path):
+    output = tmp_path / "case"
+    (output / "system_artifacts").mkdir(parents=True)
+    (output / "microsoft_coredata").mkdir(parents=True)
+    (output / "system_artifacts" / "notification_keyword_hits.json").write_text(
+        json.dumps([
+            {
+                "keyword": "Tesla",
+                "clean_snippet": "Tesla and ADHD notification fragment",
+                "app_guess": "com.apple.usernotifications",
+                "evidence_class": "notification_fragment",
+                "table": "",
+                "logical_path": "HomeDomain/Library/UserNotifications/db.sqlite",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (output / "system_artifacts" / "outlook_keyword_hits.json").write_text(
+        json.dumps([
+            {
+                "keyword": "Bikrom",
+                "clean_snippet": "Outlook cache row for Bikrom",
+                "app_guess": "com.microsoft.Office.Outlook",
+                "evidence_class": "raw_text",
+                "table": "messages",
+                "logical_path": "AppDomain-com.microsoft.Office.Outlook/Library/Caches/message.sqlite",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (output / "system_artifacts" / "tesla_app_keyword_hits.json").write_text(
+        json.dumps([
+            {
+                "keyword": "Tesla",
+                "clean_snippet": "Tesla app trace",
+                "app_guess": "com.teslamotors.TeslaApp",
+                "evidence_class": "raw_text",
+                "table": "",
+                "logical_path": "AppDomain-com.teslamotors.TeslaApp/Library/Caches/state.json",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (output / "microsoft_coredata" / "person_hits.json").write_text(
+        json.dumps([
+            {
+                "keyword": "Bikrom",
+                "clean_snippet": "Bikrom Example",
+                "app_guess": "com.microsoft.sharepoint",
+                "evidence_class": "coredata_entity",
+                "table": "ZSPPERSON",
+                "logical_path": "AppDomain-com.microsoft.sharepoint/Library/Caches/coredata.sqlite",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (output / "microsoft_coredata" / "related_rows.json").write_text(
+        json.dumps([
+            {
+                "clean_snippet": "Related SharePoint activity row",
+                "app_guess": "com.microsoft.sharepoint",
+                "evidence_class": "coredata_entity",
+                "table": "ZSPACTIVITY",
+                "logical_path": "AppDomain-com.microsoft.sharepoint/Library/Caches/coredata.sqlite",
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    result = write_review_exports(output, ["Tesla", "ADHD"], 500)
+
+    assert result["focused_review_hits"] >= 5
+    focused = (output / "review" / "focused_review_hits.csv").read_text(encoding="utf-8")
+    assert "microsoft_coredata_person_hits" in focused
+    assert "microsoft_coredata_related_rows" in focused
+    assert "notifications" in focused
+    assert "outlook" in focused
+    assert "tesla_app_traces" in focused
+    assert (output / "review" / "focused_summary_by_keyword.csv").exists()
+    assert (output / "review" / "focused_summary_by_app_domain.csv").exists()
+    assert (output / "review" / "focused_summary_by_evidence_class.csv").exists()
+    assert (output / "review" / "focused_summary_by_table.csv").exists()
+    assert (output / "review" / "focused_summary_by_logical_path.csv").exists()
+
+
+def test_milestone_2_1_duplicate_extraction_reuses_existing_artifact(tmp_path):
+    backup = _backup(tmp_path)
+    db = tmp_path / "message.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE messages (body TEXT)")
+    conn.execute("INSERT INTO messages VALUES ('Jake in Outlook cache')")
+    conn.commit()
+    conn.close()
+    _object(backup, "ab900001", db.read_bytes())
+    conn = sqlite3.connect(backup / "Manifest.db")
+    conn.execute("CREATE TABLE Files (fileID TEXT, domain TEXT, relativePath TEXT)")
+    conn.execute(
+        "INSERT INTO Files VALUES (?, ?, ?)",
+        ("ab900001", "AppDomain-com.microsoft.Office.Outlook", "Library/Caches/message.sqlite"),
+    )
+    conn.commit()
+    conn.close()
+    output = tmp_path / "case"
+    args = type(
+        "Args",
+        (),
+        {
+            "source": str(backup),
+            "output": str(output),
+            "targets": ["teams"],
+            "password_env": None,
+            "password": None,
+            "prompt_password": False,
+            "no_attachments": False,
+            "keyword": ["Jake"],
+            "sample_limit": 50,
+            "max_teams_file_mb": 20,
+            "include_large_teams_files": False,
+            "deep_app_cache_scan": False,
+            "deep_keyword": [],
+            "max_deep_file_mb": 20,
+            "include_large_deep_files": False,
+            "deep_scan_text_limit_mb": 20,
+            "deep_scan_sqlite_row_limit": 0,
+            "deep_scan_export_context": 120,
+            "write_timeline": False,
+            "system_artifacts": False,
+            "notification_scan": False,
+            "mail_scan": False,
+            "keyboard_scan": False,
+            "outlook_scan": True,
+            "chrome_scan": False,
+            "tesla_app_scan": False,
+            "microsoft_coredata_scan": False,
+            "raw_string_carve": False,
+            "sqlite_carve": False,
+            "compound_keyword": [],
+            "compound_window": 500,
+        },
+    )()
+
+    run_forensic_triage(args)
+
+    manifest_rows = list(csv.DictReader((output / "evidence_manifest.csv").open("r", newline="", encoding="utf-8")))
+    same_file_rows = [row for row in manifest_rows if row["file_id"] == "ab900001"]
+    assert len(same_file_rows) == 2
+    assert same_file_rows[0]["output_path"] == same_file_rows[1]["output_path"]
+    assert "Reused previously extracted artefact" in same_file_rows[1]["notes"]
+    assert not (output / "system_artifacts" / "extracted_files" / "AppDomain-com.microsoft.Office.Outlook" / "Library" / "Caches" / "message.sqlite").exists()
+    summary = json.loads((output / "case_summary.json").read_text(encoding="utf-8"))
+    assert summary["results"]["system_reused_files"] == 1
+
+
+def test_milestone_2_1_sms_exact_path_extraction_still_extracts_db_wal_and_shm(tmp_path):
+    backup = _backup(tmp_path)
+    _object(backup, "ac000001", b"SQLite format 3\x00sms")
+    _object(backup, "ac000002", b"wal")
+    _object(backup, "ac000003", b"shm")
+    records = [
+        _record("ac000001", "HomeDomain", "Library/SMS/sms.db"),
+        _record("ac000002", "HomeDomain", "Library/SMS/sms.db-wal"),
+        _record("ac000003", "HomeDomain", "Library/SMS/sms.db-shm"),
+    ]
+    index = {(record.domain, record.relative_path): record for record in records}
+    output = tmp_path / "case"
+    extractor = BackupExtractor(backup, output, None)
+
+    artifacts, warnings = extract_sms_artifacts(records, index, extractor, output, include_attachments=False)
+
+    assert warnings == []
+    assert len(artifacts) == 3
+    assert (output / "extracted_files" / "HomeDomain" / "Library" / "SMS" / "sms.db").exists()
+    assert (output / "extracted_files" / "HomeDomain" / "Library" / "SMS" / "sms.db-wal").exists()
+    assert (output / "extracted_files" / "HomeDomain" / "Library" / "SMS" / "sms.db-shm").exists()
+    assert all("_path_collisions" not in artifact.output_path for artifact in artifacts)

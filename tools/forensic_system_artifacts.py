@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from tools.forensic_common import (
     apple_timestamp_to_utc,
+    classify_warning_message,
     clean_control_text,
     file_size_mb,
     guess_app_from_record_domain,
@@ -423,6 +424,85 @@ def _write_category(outdir: Path, name: str, rows: list[dict[str, Any]]) -> None
     write_cards_html(outdir / f"{name}_keyword_hits.html", f"{name.replace('_', ' ').title()} Keyword Hits", rows)
 
 
+def _artifact_warning_rows(record: ManifestRecord, artifact: ExtractedArtifact, prefix: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if artifact.skip_reason:
+        message = f"{prefix} {record.logical_path}: {artifact.skip_reason}"
+        rows.append(
+            {
+                "file_id": record.file_id,
+                "logical_path": record.logical_path,
+                "message": message,
+                **classify_warning_message(message),
+            }
+        )
+    for part in artifact.notes.split(" | "):
+        if not part.startswith("Extractor warning:"):
+            continue
+        message = part.removeprefix("Extractor warning:").strip()
+        rows.append(
+            {
+                "file_id": record.file_id,
+                "logical_path": record.logical_path,
+                "message": message,
+                **classify_warning_message(message),
+            }
+        )
+    return rows
+
+
+def sqlite_integrity_check(path: Path, record: ManifestRecord, artifact: ExtractedArtifact | None = None) -> dict[str, Any]:
+    row = {
+        "file_id": record.file_id,
+        "domain": record.domain,
+        "relative_path": record.relative_path,
+        "logical_path": record.logical_path,
+        "database": str(path),
+        "sha256": sha256_file(path) if path.exists() else None,
+        "integrity_status": "not_sqlite",
+        "integrity_result": "",
+        "error": "",
+        "evidence_note": "SQLite integrity check was not applicable.",
+    }
+    if sqlite_sidecar_type(path):
+        row.update(
+            {
+                "integrity_status": "sidecar_skipped",
+                "evidence_note": "SQLite WAL/SHM sidecar was preserved but not independently integrity-checked.",
+            }
+        )
+        return row
+    if not is_sqlite_file(path):
+        return row
+    try:
+        conn = open_sqlite_ro(path)
+        try:
+            results = [str(check_row[0]) for check_row in conn.execute("PRAGMA integrity_check")]
+        finally:
+            conn.close()
+    except Exception as exc:
+        row.update(
+            {
+                "integrity_status": "error",
+                "error": str(exc),
+                "evidence_note": "SQLite integrity check could not complete; this does not mutate the evidence file.",
+            }
+        )
+        return row
+    result_text = "; ".join(results)
+    status = "ok" if results == ["ok"] else "warning"
+    row.update(
+        {
+            "integrity_status": status,
+            "integrity_result": result_text,
+            "evidence_note": "SQLite integrity_check returned ok." if status == "ok" else "SQLite integrity_check reported issues; review before relying on parser output.",
+        }
+    )
+    if artifact and classify_warning_message(artifact.notes).get("warning_category") == "decrypt_size_mismatch" and status == "ok":
+        row["evidence_note"] = "SQLite integrity_check returned ok; any decrypt-size mismatch remains warning-level unless another parser proves failure."
+    return row
+
+
 def _enabled_categories(flags: dict[str, bool]) -> set[str]:
     if flags.get("system_artifacts"):
         return set(SYSTEM_CATEGORIES)
@@ -465,6 +545,10 @@ def run_system_artifacts(
     directory_skipped = 0
     extraction_failures = 0
     extracted_files = 0
+    reused_files = 0
+    warning_rows: list[dict[str, Any]] = []
+    validation_rows: list[dict[str, Any]] = []
+    sqlite_integrity_rows: list[dict[str, Any]] = []
     enabled = _enabled_categories(flags)
     raw_enabled = flags.get("system_artifacts") or flags.get("raw_string_carve")
     sqlite_carve_enabled = flags.get("system_artifacts") or flags.get("sqlite_carve")
@@ -488,27 +572,128 @@ def run_system_artifacts(
         dest = safe_output_path(extracted_dir, record.domain, record.relative_path)
         if is_likely_directory_record(record.domain, record.relative_path, record.metadata):
             directory_skipped += 1
-            candidate_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "categories": ",".join(categories), "extracted": False, "skip_reason": "directory_record_not_extractable", "extracted_path": str(dest)})
+            candidate_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "categories": ",".join(categories), "extracted": False, "skip_reason": "directory_record_not_extractable", "extracted_path": str(dest), "validation_status": "directory_record_not_extractable"})
+            validation_rows.append(
+                {
+                    "file_id": record.file_id,
+                    "logical_path": record.logical_path,
+                    "categories": ",".join(categories),
+                    "extraction_status": "skipped",
+                    "validation_status": "directory_record_not_extractable",
+                    "warning_category": "",
+                    "warning_severity": "",
+                    "integrity_status": "",
+                    "evidence_note": "Manifest record appears to describe a directory/container, not an extractable file.",
+                }
+            )
             artifacts.append(ExtractedArtifact("system_artifact", record.file_id, record.domain, record.relative_path, record.logical_path, None, str(dest), None, None, 0, extractor.is_encrypted(), False, True, "directory_record_not_extractable"))
             continue
         source_obj = extractor.source_object_path(record.file_id)
         size_mb = file_size_mb(source_obj) if source_obj and source_obj.exists() else None
         if size_mb is not None and size_mb > max_file_mb and not include_large:
             reason = f"Skipped by system artifact size limit ({max_file_mb} MB)"
-            candidate_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "categories": ",".join(categories), "extracted": False, "skip_reason": reason, "extracted_path": str(dest)})
+            candidate_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "categories": ",".join(categories), "extracted": False, "skip_reason": reason, "extracted_path": str(dest), "validation_status": "size_skipped"})
+            validation_rows.append(
+                {
+                    "file_id": record.file_id,
+                    "logical_path": record.logical_path,
+                    "categories": ",".join(categories),
+                    "extraction_status": "skipped",
+                    "validation_status": "size_skipped",
+                    "warning_category": "",
+                    "warning_severity": "",
+                    "integrity_status": "",
+                    "evidence_note": "Artefact was visible in the manifest but skipped by configured size policy.",
+                }
+            )
             artifacts.append(ExtractedArtifact("system_artifact", record.file_id, record.domain, record.relative_path, record.logical_path, str(source_obj), str(dest), sha256_file(source_obj), None, 0, extractor.is_encrypted(), False, True, reason))
             continue
         artifact = extractor.extract_record(record, dest, "system_artifact")
         artifacts.append(artifact)
         actual_path = Path(artifact.output_path)
-        candidate_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "categories": ",".join(categories), "extracted": artifact.extracted, "skip_reason": artifact.skip_reason, "extracted_path": str(actual_path), "output_size": artifact.output_size})
+        reused = "Reused previously extracted artefact" in artifact.notes
+        artifact_warning_rows = _artifact_warning_rows(record, artifact, "Could not extract system artefact")
+        warning_rows.extend(artifact_warning_rows)
+        warning_category = ",".join(dict.fromkeys(str(row["warning_category"]) for row in artifact_warning_rows))
+        warning_severity = ",".join(dict.fromkeys(str(row["warning_severity"]) for row in artifact_warning_rows))
+        candidate_row = {
+            "file_id": record.file_id,
+            "logical_path": record.logical_path,
+            "categories": ",".join(categories),
+            "extracted": artifact.extracted,
+            "skip_reason": artifact.skip_reason,
+            "extracted_path": str(actual_path),
+            "output_size": artifact.output_size,
+            "reused_existing_extraction": reused,
+            "warning_category": warning_category,
+            "warning_severity": warning_severity,
+            "validation_status": "pending",
+            "integrity_status": "",
+        }
+        candidate_rows.append(candidate_row)
         if not artifact.extracted:
             extraction_failures += 1
             warnings.append(f"Could not extract system artefact {record.logical_path}: {artifact.skip_reason}")
+            candidate_row["validation_status"] = "extraction_failure"
+            validation_rows.append(
+                {
+                    "file_id": record.file_id,
+                    "logical_path": record.logical_path,
+                    "categories": ",".join(categories),
+                    "extraction_status": "failed",
+                    "validation_status": "extraction_failure",
+                    "warning_category": warning_category or "extraction_failure",
+                    "warning_severity": warning_severity or "error",
+                    "integrity_status": "",
+                    "evidence_note": "Extraction failed, so this artefact was not parsed in this run.",
+                }
+            )
             continue
         extracted_files += 1
+        if reused:
+            reused_files += 1
         if sqlite_sidecar_type(actual_path):
+            integrity_row = sqlite_integrity_check(actual_path, record, artifact)
+            sqlite_integrity_rows.append(integrity_row)
+            candidate_row["validation_status"] = "sidecar_preserved"
+            candidate_row["integrity_status"] = integrity_row["integrity_status"]
+            validation_rows.append(
+                {
+                    "file_id": record.file_id,
+                    "logical_path": record.logical_path,
+                    "categories": ",".join(categories),
+                    "extraction_status": "reused" if reused else "extracted",
+                    "validation_status": "sidecar_preserved",
+                    "warning_category": warning_category,
+                    "warning_severity": warning_severity,
+                    "integrity_status": integrity_row["integrity_status"],
+                    "evidence_note": integrity_row["evidence_note"],
+                }
+            )
             continue
+        if is_sqlite_file(actual_path):
+            integrity_row = sqlite_integrity_check(actual_path, record, artifact)
+            sqlite_integrity_rows.append(integrity_row)
+            candidate_row["integrity_status"] = integrity_row["integrity_status"]
+            if integrity_row["integrity_status"] == "error":
+                message = f"Could not run SQLite integrity_check for {record.logical_path}: {integrity_row['error']}"
+                warning_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "message": message, **classify_warning_message(message)})
+        candidate_row["validation_status"] = "reused" if reused else "extracted"
+        if warning_category == "decrypt_size_mismatch" and candidate_row["integrity_status"] == "ok":
+            candidate_row["validation_status"] = "extracted_with_warning_integrity_ok"
+        validation_rows.append(
+            {
+                "file_id": record.file_id,
+                "logical_path": record.logical_path,
+                "categories": ",".join(categories),
+                "extraction_status": "reused" if reused else "extracted",
+                "validation_status": candidate_row["validation_status"],
+                "warning_category": warning_category,
+                "warning_severity": warning_severity,
+                "integrity_status": candidate_row["integrity_status"],
+                "evidence_note": "CoreData rows are entity/relationship records, not messages; raw strings are fragment-level evidence; SQLite raw byte hits are not deleted-row recovery unless independently proven.",
+            }
+        )
         for category in categories:
             scan_keywords = list(dict.fromkeys(keywords + (MAIL_EXTRA_KEYWORDS if category == "mail" else [])))
             evidence_class = {
@@ -521,7 +706,9 @@ def run_system_artifacts(
                 category_hits[category].extend(hits)
                 all_hits_for_compound.extend(hits)
             except Exception as exc:
-                warnings.append(f"Could not inspect system artefact {record.logical_path}: {exc}")
+                message = f"Could not inspect system artefact {record.logical_path}: {exc}"
+                warnings.append(message)
+                warning_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "message": message, **classify_warning_message(message)})
         if coredata_enabled and is_sqlite_file(actual_path) and microsoft_candidate:
             try:
                 person_hits, related, schema = inspect_microsoft_coredata(actual_path, record, keywords, context)
@@ -530,23 +717,38 @@ def run_system_artifacts(
                 core_schema_rows.extend(schema)
                 all_hits_for_compound.extend(person_hits)
             except Exception as exc:
-                warnings.append(f"Could not inspect Microsoft CoreData database {record.logical_path}: {exc}")
+                message = f"Could not inspect Microsoft CoreData database {record.logical_path}: {exc}"
+                warnings.append(message)
+                warning_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "message": message, **classify_warning_message(message)})
         if raw_enabled:
             try:
                 hits = raw_string_carve(actual_path, record, keywords, context)
                 raw_hits.extend(hits)
                 all_hits_for_compound.extend(hits)
             except Exception as exc:
-                warnings.append(f"Could not raw-string carve {record.logical_path}: {exc}")
+                message = f"Could not raw-string carve {record.logical_path}: {exc}"
+                warnings.append(message)
+                warning_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "message": message, **classify_warning_message(message)})
         if sqlite_carve_enabled and is_sqlite_file(actual_path):
             try:
                 hits = sqlite_raw_byte_carve(actual_path, record, keywords, context)
                 sqlite_raw_hits.extend(hits)
                 all_hits_for_compound.extend(hits)
             except Exception as exc:
-                warnings.append(f"Could not SQLite raw-byte carve {record.logical_path}: {exc}")
+                message = f"Could not SQLite raw-byte carve {record.logical_path}: {exc}"
+                warnings.append(message)
+                warning_rows.append({"file_id": record.file_id, "logical_path": record.logical_path, "message": message, **classify_warning_message(message)})
     write_csv(outdir / "system_candidate_files.csv", candidate_rows)
     write_json(outdir / "system_candidate_files.json", candidate_rows)
+    write_csv(outdir / "system_validation_report.csv", validation_rows)
+    write_json(outdir / "system_validation_report.json", validation_rows)
+    write_table_html(outdir / "system_validation_report.html", "System Artifact Validation Report", validation_rows)
+    write_csv(outdir / "warning_classification.csv", warning_rows)
+    write_json(outdir / "warning_classification.json", warning_rows)
+    write_table_html(outdir / "warning_classification.html", "System Artifact Warning Classification", warning_rows)
+    write_csv(outdir / "sqlite_integrity_checks.csv", sqlite_integrity_rows)
+    write_json(outdir / "sqlite_integrity_checks.json", sqlite_integrity_rows)
+    write_table_html(outdir / "sqlite_integrity_checks.html", "SQLite Integrity Checks", sqlite_integrity_rows)
     for category, rows in category_hits.items():
         _write_category(outdir, category, rows)
     write_csv(outdir / "raw_string_hits.csv", raw_hits)
@@ -572,8 +774,15 @@ def run_system_artifacts(
     summary = {
         "candidate_files": len(candidate_rows),
         "extracted_files": extracted_files,
+        "reused_files": reused_files,
         "directory_records_skipped": directory_skipped,
         "extraction_failures": extraction_failures,
+        "classified_warnings": len(warning_rows),
+        "decrypt_size_mismatch_warnings": sum(1 for row in warning_rows if row.get("warning_category") == "decrypt_size_mismatch"),
+        "sqlite_integrity_checked": sum(1 for row in sqlite_integrity_rows if row.get("integrity_status") in {"ok", "warning", "error"}),
+        "sqlite_integrity_ok": sum(1 for row in sqlite_integrity_rows if row.get("integrity_status") == "ok"),
+        "sqlite_integrity_warnings": sum(1 for row in sqlite_integrity_rows if row.get("integrity_status") == "warning"),
+        "sqlite_integrity_errors": sum(1 for row in sqlite_integrity_rows if row.get("integrity_status") == "error"),
         "notification_hits": len(category_hits["notification"]),
         "mail_hits": len(category_hits["mail"]),
         "outlook_hits": len(category_hits["outlook"]),
@@ -585,6 +794,7 @@ def run_system_artifacts(
         "raw_string_hits": len(raw_hits),
         "sqlite_raw_hits": len(sqlite_raw_hits),
         "compound_keyword_hits": len(compound_rows),
+        "evidence_language_note": "CoreData rows are entity/relationship records, raw string hits are fragment-level evidence, SQLite raw byte hits are not deleted-row recovery unless independently proven, and decrypt-size mismatch is warning-level until integrity checks or parser failures prove failure.",
     }
     write_json(outdir / "system_artifacts_summary.json", summary)
     write_table_html(outdir / "system_artifacts_summary.html", "System Artifacts Summary", [summary])

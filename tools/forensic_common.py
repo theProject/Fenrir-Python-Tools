@@ -173,6 +173,42 @@ def snippet_quality_fields(snippet: str, evidence_class: str) -> dict[str, objec
     }
 
 
+def classify_warning_message(message: str) -> dict[str, str]:
+    text = str(message or "")
+    lowered = text.lower()
+    if "decrypt" in lowered and "size" in lowered and (
+        "mismatch" in lowered or "does not match" in lowered or "expected" in lowered
+    ):
+        return {
+            "warning_category": "decrypt_size_mismatch",
+            "warning_severity": "warning",
+            "professional_note": "Decrypt-size mismatch is warning-level until integrity checks or parser failures prove an extraction failure.",
+        }
+    if (
+        "could not extract" in lowered
+        or "extraction failed" in lowered
+        or "encrypted extraction failed" in lowered
+        or "no such file" in lowered
+        or "filenotfound" in lowered
+    ):
+        return {
+            "warning_category": "extraction_failure",
+            "warning_severity": "error",
+            "professional_note": "Extraction failure means the artefact was not available for parsing from this run.",
+        }
+    if "could not inspect" in lowered or "could not open sqlite" in lowered or "malformed" in lowered or "database disk image" in lowered:
+        return {
+            "warning_category": "inspection_warning",
+            "warning_severity": "warning",
+            "professional_note": "Inspection warning means the artefact was extracted but one parser could not fully inspect it.",
+        }
+    return {
+        "warning_category": "general_warning",
+        "warning_severity": "warning",
+        "professional_note": "Warning requires review but does not by itself prove evidence loss.",
+    }
+
+
 def _metadata_mode(metadata: dict[str, Any]) -> int | None:
     for key in ("Mode", "mode", "st_mode", "ProtectionClassMode"):
         value = metadata.get(key)
