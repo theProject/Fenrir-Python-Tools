@@ -57,6 +57,13 @@ KNOWN_CONTAINER_NAMES = {
     "webservicecache",
     "mruservicecache",
     "localcacheroot",
+    "file provider storage",
+    "ariaevententrycache",
+    "rctasynclocalstorage_v1",
+    ".isolated-storage",
+    "userinfocache",
+    "onedrivemessageextension",
+    "com.microsoft.splists_logs",
     "sharedlogs",
     "attachmentstorage",
     "streamcache",
@@ -68,8 +75,15 @@ CONTAINER_PARENT_NAMES = {
     "resourceinfocache",
     "webservicecache",
     "mruservicecache",
+    "localcacheroot",
+    "file provider storage",
+    "onedrivemessageextension",
+    "rctasynclocalstorage_v1",
+    ".isolated-storage",
 }
 HEX_BASENAME_RE = re.compile(r"^[0-9a-fA-F]{32,}$")
+ONEDRIVE_ITEM_RE = re.compile(r"^item\|", re.I)
+URL_ENCODED_GUID_RE = re.compile(r"%2d[0-9a-fA-F]{4}%2d[0-9a-fA-F]{4}%2d[0-9a-fA-F]{4}%2d")
 
 
 def sha256_file(path: Path) -> str:
@@ -205,11 +219,12 @@ def is_likely_directory_record(domain: str, relative_path: str, metadata: dict[s
     if metadata_indicates_directory(metadata):
         return True
     normalized = str(Path(relative_path).as_posix()).strip("/")
-    if not normalized:
+    if normalized in {"", "."}:
         return True
     if _has_known_file_extension(normalized):
         return False
     normalized_lower = normalized.lower()
+    domain_lower = (domain or "").lower()
     for suffix in CONTAINER_PATH_SUFFIXES:
         suffix_lower = suffix.lower()
         if normalized_lower == suffix_lower or normalized_lower.endswith(f"/{suffix_lower}"):
@@ -218,7 +233,15 @@ def is_likely_directory_record(domain: str, relative_path: str, metadata: dict[s
     leaf = parts[-1] if parts else ""
     if leaf in KNOWN_CONTAINER_NAMES:
         return True
+    if "onedrivemessageextension" in domain_lower and leaf in {"library", "preferences", "documents"}:
+        return True
+    if leaf in {"v0", "v1"} and "indexeddb" in parts:
+        return True
+    if leaf == "files" and "localcacheroot" in parts:
+        return True
     if any(parent in parts[:-1] for parent in CONTAINER_PARENT_NAMES):
+        return True
+    if "file provider storage" in parts and (ONEDRIVE_ITEM_RE.match(Path(normalized).name) or URL_ENCODED_GUID_RE.search(normalized)):
         return True
     if HEX_BASENAME_RE.match(leaf) and any(parent in parts for parent in {"indexeddb", "localstorage"}):
         return True

@@ -183,3 +183,51 @@ def test_milestone_1_1_hash_like_extensionless_indexeddb_child_is_skipped_unless
         path,
         {"Mode": 0o100644},
     )
+
+
+def test_milestone_1_2_microsoft_virtual_storage_warning_paths_are_skipped():
+    paths = [
+        ("AppDomain-com.microsoft.splists", "Library/WebKit/WebsiteData/IndexedDB/v0"),
+        ("AppDomain-com.microsoft.sharepoint", "Library/localCacheRoot/e5abe53d95bcb1c8ecd317956df7510c"),
+        ("AppDomain-com.microsoft.sharepoint", "Library/localCacheRoot/e5abe53d95bcb1c8ecd317956df7510c/files"),
+        ("AppDomain-com.microsoft.sharepoint", "Documents/RCTAsyncLocalStorage_V1"),
+        ("AppDomainPlugin-com.microsoft.skydrive.OneDriveMessageExtension", ""),
+        ("AppDomainPlugin-com.microsoft.skydrive.OneDriveMessageExtension", "Library"),
+        ("AppDomainPlugin-com.microsoft.skydrive.OneDriveMessageExtension", "Library/Preferences"),
+        ("AppDomainPlugin-com.microsoft.skydrive.OneDriveMessageExtension", "Documents"),
+        ("AppDomain-com.microsoft.o365shdmobileapp", "Documents/.config/.isolated-storage"),
+        ("AppDomain-com.microsoft.skype.teams", "Library/WebKit/WebsiteData/IndexedDB/v1"),
+        ("AppDomainGroup-group.com.microsoft.shared", "com.microsoft.splists_logs"),
+        ("AppDomain-com.microsoft.onenote", "Library/Application Support/Microsoft/UserInfoCache"),
+        ("AppDomainGroup-group.com.microsoft.onedrive", "AriaEventEntryCache"),
+        ("AppDomainGroup-group.com.microsoft.onedrive", "File Provider Storage"),
+        (
+            "AppDomainGroup-group.com.microsoft.onedrive",
+            "File Provider Storage/item|149|8b1f1304%2Dfead%2D4bf0%2D9326%2D23f87a71040c",
+        ),
+    ]
+
+    for domain, relative_path in paths:
+        assert is_likely_directory_record(domain, relative_path), relative_path
+
+
+def test_milestone_1_2_clear_files_under_virtual_containers_are_not_skipped():
+    paths = [
+        ("AppDomainGroup-group.com.microsoft.onedrive", "File Provider Storage/item|1|abc/file.json"),
+        ("AppDomain-com.microsoft.sharepoint", "Library/localCacheRoot/cache.sqlite"),
+        ("AppDomain-com.microsoft.msedge", "Library/WebKit/WebsiteData/Default/foo/IndexedDB/blob.sqlite"),
+        ("AppDomain-com.example.app", "Library/Caches/user"),
+    ]
+
+    for domain, relative_path in paths:
+        assert not is_likely_directory_record(domain, relative_path), relative_path
+
+
+def test_milestone_1_2_onedrive_item_pseudo_path_is_not_skipped_when_metadata_proves_file():
+    path = "File Provider Storage/item|149|8b1f1304%2Dfead%2D4bf0%2D9326%2D23f87a71040c"
+
+    assert not is_likely_directory_record(
+        "AppDomainGroup-group.com.microsoft.onedrive",
+        path,
+        {"Mode": 0o100644},
+    )
