@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 from collections import Counter
 import getpass
 import os
@@ -17,6 +18,7 @@ from typing import Any
 from utils import log_ok, log_warn
 
 from tools.forensic_common import is_output_inside_source, open_sqlite_ro, safe_output_path, sha256_file
+from tools.forensic_case_focus import add_case_target_args, build_case_targets, write_case_focus_exports, write_photo_candidate_exports
 from tools.forensic_deep_scan import DEFAULT_DEEP_KEYWORDS, run_deep_scan
 from tools.forensic_models import ExtractedArtifact, ForensicError, ManifestRecord, TriageResult
 from tools.forensic_reports import utc_now_iso, write_case_summary, write_csv, write_json, write_table_html
@@ -64,6 +66,7 @@ def add_forensic_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--sqlite-carve", action="store_true")
     p.add_argument("--compound-keyword", action="append", default=[])
     p.add_argument("--compound-window", type=int, default=500)
+    add_case_target_args(p)
 
 
 def get_password(args: argparse.Namespace) -> str | None:
@@ -230,23 +233,67 @@ class BackupExtractor:
 
 
 def encrypted_extract_file(backup: Any, record: ManifestRecord, output_path: Path) -> None:
-    attempts = [
-        lambda: backup.extract_file(relative_path=record.relative_path, domain_like=record.domain, output_filename=str(output_path)),
-        lambda: backup.extract_file(relative_path=record.relative_path, domain=record.domain, output_filename=str(output_path)),
-        lambda: backup.extract_file(relative_path=record.relative_path, output_filename=str(output_path)),
-        lambda: backup.extract_file(record.relative_path, str(output_path)),
-    ]
+    extract = getattr(backup, "extract_file", None)
+    if not callable(extract):
+        raise ForensicError("Encrypted extraction failed: backup adapter has no callable extract_file method.")
+    try:
+        signature = inspect.signature(extract)
+    except (TypeError, ValueError):
+        signature = None
     errors: list[str] = []
-    for attempt in attempts:
+
+    def finish(result: Any) -> bool:
+        if isinstance(result, (bytes, bytearray)):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(bytes(result))
+        elif isinstance(result, str | Path) and Path(result).exists() and not output_path.exists():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(result), output_path)
+        return output_path.exists()
+
+    if signature is not None:
+        params = list(signature.parameters.values())
+        names = {param.name for param in params}
+        has_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params)
+        has_var_args = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params)
+        positional_only = {param.name for param in params if param.kind == inspect.Parameter.POSITIONAL_ONLY}
+        required_positional = [
+            param
+            for param in params
+            if param.default is inspect.Parameter.empty
+            and param.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+        ]
+        accepts_keywords = has_var_kwargs or (
+            {"relative_path", "output_filename"}.issubset(names)
+            and not {"relative_path", "output_filename"}.intersection(positional_only)
+        )
+        if accepts_keywords:
+            kwargs = {"relative_path": record.relative_path, "output_filename": str(output_path)}
+            if has_var_kwargs or "domain_like" in names:
+                kwargs["domain_like"] = record.domain
+            try:
+                if finish(extract(**kwargs)):
+                    return
+            except Exception as exc:
+                errors.append(str(exc))
+        elif has_var_args or len(required_positional) in {2, 3}:
+            args = (record.relative_path, str(output_path)) if len(required_positional) <= 2 else (record.relative_path, record.domain, str(output_path))
+            try:
+                if finish(extract(*args)):
+                    return
+            except Exception as exc:
+                errors.append(str(exc))
+        else:
+            errors.append(f"Unsupported EncryptedBackup.extract_file signature: {signature}")
+    else:
         try:
-            attempt()
-            if output_path.exists():
+            if finish(extract(relative_path=record.relative_path, domain_like=record.domain, output_filename=str(output_path))):
                 return
-        except TypeError as exc:
-            errors.append(str(exc))
         except Exception as exc:
             errors.append(str(exc))
-    raise ForensicError(f"Encrypted extraction failed for {record.logical_path}: {'; '.join(errors[-3:])}")
+
+    detail = "; ".join(error for error in errors if error) or "extract_file returned without creating output"
+    raise ForensicError(f"Encrypted extraction failed for {record.logical_path}: {detail}")
 
 
 def load_manifest_records(manifest_db: Path) -> list[ManifestRecord]:
@@ -499,6 +546,8 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
     export_manifest_index(records, output)
     log_lines.append("Loaded manifest records")
     index = {(r.domain, r.relative_path): r for r in records}
+    case_targets = build_case_targets(args)
+    case_terms = case_targets.search_terms
     artifacts: list[ExtractedArtifact] = []
     sms_count = 0
     teams_result: dict[str, Any] = {"candidate_files": 0, "sqlite_databases": 0, "keyword_hits": 0, "text_hits": 0}
@@ -515,11 +564,11 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
         log_lines.append("Extracted SMS database")
         log_lines.append("Parsed SMS messages")
     if targets.intersection({"teams", "microsoft_teams"}):
-        teams_result = run_teams_triage(records, extractor, output, args.keyword, args.sample_limit, args.max_teams_file_mb, args.include_large_teams_files, warnings)
+        teams_result = run_teams_triage(records, extractor, output, list(dict.fromkeys(args.keyword + case_terms)), args.sample_limit, args.max_teams_file_mb, args.include_large_teams_files, warnings)
         artifacts.extend(teams_result.pop("artifacts"))
         log_lines.append("Found Teams candidates")
     if args.deep_app_cache_scan:
-        deep_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword))
+        deep_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + case_terms))
         deep_result = run_deep_scan(
             records,
             extractor,
@@ -546,8 +595,20 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
         "raw_string_carve": bool(getattr(args, "raw_string_carve", False)),
         "sqlite_carve": bool(getattr(args, "sqlite_carve", False)),
     }
+    if case_targets.enabled:
+        focus_sources = set(case_targets.focus_sources)
+        system_flags["notification_scan"] = system_flags["notification_scan"] or "notifications" in focus_sources
+        system_flags["mail_scan"] = system_flags["mail_scan"] or "mail" in focus_sources
+        system_flags["outlook_scan"] = system_flags["outlook_scan"] or "outlook" in focus_sources
+        system_flags["chrome_scan"] = system_flags["chrome_scan"] or "chrome" in focus_sources
+        system_flags["tesla_app_scan"] = system_flags["tesla_app_scan"] or not focus_sources or "tesla" in " ".join(case_terms).lower()
+        system_flags["microsoft_coredata_scan"] = system_flags["microsoft_coredata_scan"] or "microsoft-coredata" in focus_sources
+        system_flags["raw_string_carve"] = system_flags["raw_string_carve"] or "raw" in focus_sources
+        system_flags["sqlite_carve"] = system_flags["sqlite_carve"] or "sqlite-raw" in focus_sources
     if any(system_flags.values()) or getattr(args, "compound_keyword", []):
-        system_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + args.keyword))
+        system_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + args.keyword + case_terms))
+        compound_terms = list(getattr(args, "compound_keyword", []))
+        compound_terms.extend(f"{left},{right}" for left, right in case_targets.near_terms)
         system_result = run_system_artifacts(
             records,
             extractor,
@@ -559,15 +620,21 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
             args.deep_scan_text_limit_mb,
             args.deep_scan_sqlite_row_limit,
             args.deep_scan_export_context,
-            getattr(args, "compound_keyword", []),
+            compound_terms,
             getattr(args, "compound_window", 500),
             warnings,
         )
         artifacts.extend(system_result.pop("artifacts", []))
         log_lines.append("Ran system artefact scan")
+    include_photos = bool(getattr(args, "photo_candidate_scan", False) or "photos" in case_targets.focus_sources)
+    include_screenshots = bool(getattr(args, "screenshot_candidate_scan", False) or "screenshots" in case_targets.focus_sources)
+    photo_result = write_photo_candidate_exports(output, records, include_photos, include_screenshots)
+    if include_photos or include_screenshots:
+        log_lines.append("Wrote photo/screenshot candidate reports")
     if args.write_timeline:
         _write_timeline(output)
     review_result = write_review_exports(output, getattr(args, "compound_keyword", []), getattr(args, "compound_window", 500))
+    case_result = write_case_focus_exports(output, case_targets)
     _write_evidence_manifest(output, artifacts)
     log_lines.append("Wrote evidence manifest")
     write_json(output / "warnings.json", warnings)
@@ -607,6 +674,10 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
             "deep_scan_export_context": deep_result.get("export_context", args.deep_scan_export_context),
             "high_signal_hits": review_result.get("high_signal_hits", 0),
             "focused_review_hits": review_result.get("focused_review_hits", 0),
+            "case_focus_hits": case_result.get("case_hits", 0),
+            "case_review_queue": case_result.get("case_review_queue", 0),
+            "photo_candidates": photo_result.get("photo_candidates", 0),
+            "screenshot_candidates": photo_result.get("screenshot_candidates", 0),
             "notification_hits": system_result.get("notification_hits", 0),
             "mail_hits": system_result.get("mail_hits", 0),
             "outlook_hits": system_result.get("outlook_hits", 0),
