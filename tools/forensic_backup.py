@@ -21,8 +21,9 @@ from tools.forensic_common import is_output_inside_source, open_sqlite_ro, safe_
 from tools.forensic_case_focus import add_case_target_args, build_case_targets, write_case_focus_exports, write_photo_candidate_exports
 from tools.forensic_deep_scan import DEFAULT_DEEP_KEYWORDS, run_deep_scan
 from tools.forensic_models import ExtractedArtifact, ForensicError, ManifestRecord, TriageResult
-from tools.forensic_reports import utc_now_iso, write_case_summary, write_csv, write_json, write_table_html
+from tools.forensic_reports import set_report_options, utc_now_iso, write_case_summary, write_csv, write_json, write_table_html
 from tools.forensic_reports import write_cards_html
+from tools.forensic_run_control import STAGES, RunControl
 from tools.forensic_sms import extract_sms_artifacts, parse_sms_exports
 from tools.forensic_system_artifacts import compound_keyword_hits, run_system_artifacts
 from tools.forensic_teams import run_teams_triage
@@ -66,6 +67,21 @@ def add_forensic_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--sqlite-carve", action="store_true")
     p.add_argument("--compound-keyword", action="append", default=[])
     p.add_argument("--compound-window", type=int, default=500)
+    p.add_argument("--disable-compound-review", action="store_true")
+    p.add_argument("--only-stage", choices=[*STAGES, "summary"])
+    p.add_argument("--skip-stage", action="append", choices=STAGES, default=[])
+    p.add_argument("--stop-after-stage", choices=STAGES)
+    p.add_argument("--case-focus-only", action="store_true")
+    p.add_argument("--review-only", action="store_true")
+    p.add_argument("--summary-only", action="store_true")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--skip-existing-extractions", action="store_true")
+    p.add_argument("--csv-only", action="store_true")
+    p.add_argument("--no-html", action="store_true")
+    p.add_argument("--no-large-html", action="store_true")
+    p.add_argument("--max-report-rows", type=int, default=1000)
+    p.add_argument("--max-case-review-rows", type=int, default=250)
+    p.add_argument("--progress-every", type=int, default=500)
     add_case_target_args(p)
 
 
@@ -101,12 +117,13 @@ def validate_backup_source(source: Path, output: Path) -> tuple[dict[str, Any], 
 
 
 class BackupExtractor:
-    def __init__(self, source: Path, output: Path, password: str | None):
+    def __init__(self, source: Path, output: Path, password: str | None, skip_existing: bool = False):
         self.source = source
         self.output = output
         self.workspace = output / "_workspace"
         self.extracted_root = output / "extracted_files"
         self.password = password
+        self.skip_existing = skip_existing
         self.manifest_plist = _read_plist(source / "Manifest.plist")
         self.encrypted = bool(self.manifest_plist.get("IsEncrypted", False))
         self._encrypted_backup: Any | None = None
@@ -183,6 +200,25 @@ class BackupExtractor:
         output_path, collision_note = self._prepare_output_path(record, requested_path, label)
         source_obj = self.source_object_path(record.file_id)
         source_hash = sha256_file(source_obj) if source_obj and source_obj.exists() else None
+        if self.skip_existing and output_path.exists() and output_path.is_file():
+            output_hash = sha256_file(output_path)
+            artifact = ExtractedArtifact(
+                label=label,
+                file_id=record.file_id,
+                domain=record.domain,
+                relative_path=record.relative_path,
+                logical_path=record.logical_path,
+                source_path=str(source_obj) if source_obj else None,
+                output_path=str(output_path),
+                source_sha256=source_hash,
+                output_sha256=output_hash,
+                output_size=output_path.stat().st_size,
+                encrypted=self.encrypted,
+                extracted=True,
+                notes="Reused existing extracted artefact because --skip-existing-extractions was set.",
+            )
+            self._extraction_cache[cache_key] = artifact
+            return artifact
         try:
             with py_warnings.catch_warnings(record=True) as caught_warnings:
                 py_warnings.simplefilter("always")
@@ -532,19 +568,59 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
     source = Path(args.source).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    set_report_options(
+        no_html=bool(getattr(args, "no_html", False)),
+        csv_only=bool(getattr(args, "csv_only", False)),
+        no_large_html=bool(getattr(args, "no_large_html", True)),
+        max_report_rows=int(getattr(args, "max_report_rows", 1000) or 1000),
+    )
+    only_stage = getattr(args, "only_stage", None)
+    if getattr(args, "case_focus_only", False):
+        only_stage = "case_focus"
+    if getattr(args, "review_only", False):
+        only_stage = "review"
+    if getattr(args, "summary_only", False):
+        only_stage = "summary"
+    normalized_only_stage = "case_summary" if only_stage == "summary" else only_stage
+    skip_stages = list(getattr(args, "skip_stage", []) or [])
+    run_control = RunControl(output, normalized_only_stage, skip_stages, getattr(args, "stop_after_stage", None))
+
+    def stage_enabled(stage: str) -> bool:
+        return run_control.enabled(stage)
+
+    def stop_if_requested(stage: str) -> bool:
+        return run_control.should_stop_after(stage)
+
     warnings: list[str] = []
     log_lines: list[str] = []
-    manifest_plist, info_plist = validate_backup_source(source, output)
-    log_lines.append("Loaded Manifest.plist")
-    backup_encrypted = bool(manifest_plist.get("IsEncrypted", False))
-    log_lines.append(f"Backup encrypted: {str(backup_encrypted).lower()}")
-    password = get_password(args)
-    extractor = BackupExtractor(source, output, password)
-    manifest_db = extractor.save_manifest_db()
-    log_lines.append("Saved decrypted Manifest.db" if backup_encrypted else "Copied Manifest.db to workspace")
-    records = load_manifest_records(manifest_db)
-    export_manifest_index(records, output)
-    log_lines.append("Loaded manifest records")
+    manifest_plist: dict[str, Any] = {}
+    info_plist: dict[str, Any] = {}
+    backup_encrypted = False
+    extractor: BackupExtractor | None = None
+    records: list[ManifestRecord] = []
+    manifest_db = output / "_workspace" / "Manifest.db"
+
+    run_control.start("workspace")
+    try:
+        manifest_plist, info_plist = validate_backup_source(source, output)
+        log_lines.append("Loaded Manifest.plist")
+        backup_encrypted = bool(manifest_plist.get("IsEncrypted", False))
+        log_lines.append(f"Backup encrypted: {str(backup_encrypted).lower()}")
+        password = get_password(args)
+        extractor = BackupExtractor(source, output, password, skip_existing=bool(getattr(args, "skip_existing_extractions", False)))
+        if not (getattr(args, "resume", False) and manifest_db.exists()):
+            manifest_db = extractor.save_manifest_db()
+            log_lines.append("Saved decrypted Manifest.db" if backup_encrypted else "Copied Manifest.db to workspace")
+        records = load_manifest_records(manifest_db)
+        export_manifest_index(records, output)
+        log_lines.append("Loaded manifest records")
+        run_control.complete("workspace", {"manifest_records": len(records), "backup_encrypted": backup_encrypted})
+    except Exception as exc:
+        run_control.fail("workspace", exc)
+        raise
+    if stop_if_requested("workspace"):
+        return TriageResult(str(output), backup_encrypted, len(records), 0, 0, 0, 0, 0, warnings=warnings)
+
     index = {(r.domain, r.relative_path): r for r in records}
     case_targets = build_case_targets(args)
     case_terms = case_targets.search_terms
@@ -553,36 +629,82 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
     teams_result: dict[str, Any] = {"candidate_files": 0, "sqlite_databases": 0, "keyword_hits": 0, "text_hits": 0}
     deep_result: dict[str, Any] = {"candidate_files": 0, "extracted_files": 0, "keyword_hits": 0, "skipped_files": 0, "sqlite_databases": 0, "text_files": 0}
     system_result: dict[str, Any] = {}
+    photo_result: dict[str, Any] = {"photo_candidates": 0, "screenshot_candidates": 0}
+    review_result: dict[str, Any] = {"high_signal_hits": 0, "focused_review_hits": 0, "compound_keyword_hits": 0}
+    case_result: dict[str, Any] = {"case_hits": 0, "case_review_queue": 0}
     targets = set(args.targets)
-    if targets.intersection({"sms", "messages", "imessage"}):
-        sms_artifacts, sms_warnings = extract_sms_artifacts(records, index, extractor, output, include_attachments=not args.no_attachments)
-        artifacts.extend(sms_artifacts)
-        warnings.extend(sms_warnings)
-        sms_db = output / "extracted_files" / "HomeDomain" / "Library" / "SMS" / "sms.db"
-        sms_parse = parse_sms_exports(sms_db, output / "sms", warnings)
-        sms_count = sms_parse.get("messages", 0)
-        log_lines.append("Extracted SMS database")
-        log_lines.append("Parsed SMS messages")
-    if targets.intersection({"teams", "microsoft_teams"}):
-        teams_result = run_teams_triage(records, extractor, output, list(dict.fromkeys(args.keyword + case_terms)), args.sample_limit, args.max_teams_file_mb, args.include_large_teams_files, warnings)
-        artifacts.extend(teams_result.pop("artifacts"))
-        log_lines.append("Found Teams candidates")
-    if args.deep_app_cache_scan:
-        deep_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + case_terms))
-        deep_result = run_deep_scan(
-            records,
-            extractor,
-            output,
-            deep_keywords,
-            args.max_deep_file_mb,
-            args.include_large_deep_files,
-            args.deep_scan_text_limit_mb,
-            args.deep_scan_sqlite_row_limit,
-            args.deep_scan_export_context,
-            warnings,
-        )
-        artifacts.extend(deep_result.pop("artifacts"))
-        log_lines.append("Ran deep app cache scan")
+
+    if stage_enabled("sms") and targets.intersection({"sms", "messages", "imessage"}):
+        if getattr(args, "resume", False) and (output / "sms" / "sms_messages.csv").exists():
+            run_control.skip("sms", "resume_existing_sms_outputs")
+        else:
+            run_control.start("sms")
+            try:
+                assert extractor is not None
+                sms_artifacts, sms_warnings = extract_sms_artifacts(records, index, extractor, output, include_attachments=not args.no_attachments)
+                artifacts.extend(sms_artifacts)
+                warnings.extend(sms_warnings)
+                sms_db = output / "extracted_files" / "HomeDomain" / "Library" / "SMS" / "sms.db"
+                sms_parse = parse_sms_exports(sms_db, output / "sms", warnings)
+                sms_count = sms_parse.get("messages", 0)
+                log_lines.append("Extracted SMS database")
+                log_lines.append("Parsed SMS messages")
+                run_control.complete("sms", {"messages": sms_count, "artifacts": len(sms_artifacts)})
+            except Exception as exc:
+                run_control.fail("sms", exc)
+                raise
+        if stop_if_requested("sms"):
+            return TriageResult(str(output), backup_encrypted, len(records), sum(1 for a in artifacts if a.extracted), sms_count, 0, 0, 0, warnings=warnings)
+    elif "sms" not in skip_stages:
+        run_control.skip("sms", "stage_not_selected")
+
+    if stage_enabled("teams") and targets.intersection({"teams", "microsoft_teams"}):
+        if getattr(args, "resume", False) and (output / "teams" / "teams_candidate_files.csv").exists():
+            run_control.skip("teams", "resume_existing_teams_outputs")
+        else:
+            run_control.start("teams")
+            try:
+                assert extractor is not None
+                teams_result = run_teams_triage(records, extractor, output, list(dict.fromkeys(args.keyword + case_terms)), args.sample_limit, args.max_teams_file_mb, args.include_large_teams_files, warnings)
+                artifacts.extend(teams_result.pop("artifacts"))
+                log_lines.append("Found Teams candidates")
+                run_control.complete("teams", teams_result)
+            except Exception as exc:
+                run_control.fail("teams", exc)
+                raise
+        if stop_if_requested("teams"):
+            return TriageResult(str(output), backup_encrypted, len(records), sum(1 for a in artifacts if a.extracted), sms_count, teams_result.get("candidate_files", 0), teams_result.get("sqlite_databases", 0), teams_result.get("keyword_hits", 0) + teams_result.get("text_hits", 0), warnings=warnings)
+    elif "teams" not in skip_stages:
+        run_control.skip("teams", "stage_not_selected")
+
+    if stage_enabled("deep_scan") and args.deep_app_cache_scan:
+        run_control.start("deep_scan")
+        try:
+            assert extractor is not None
+            deep_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + case_terms))
+            deep_result = run_deep_scan(
+                records,
+                extractor,
+                output,
+                deep_keywords,
+                args.max_deep_file_mb,
+                args.include_large_deep_files,
+                args.deep_scan_text_limit_mb,
+                args.deep_scan_sqlite_row_limit,
+                args.deep_scan_export_context,
+                warnings,
+            )
+            artifacts.extend(deep_result.pop("artifacts"))
+            log_lines.append("Ran deep app cache scan")
+            run_control.complete("deep_scan", deep_result)
+        except Exception as exc:
+            run_control.fail("deep_scan", exc)
+            raise
+        if stop_if_requested("deep_scan"):
+            return TriageResult(str(output), backup_encrypted, len(records), sum(1 for a in artifacts if a.extracted), sms_count, teams_result.get("candidate_files", 0), teams_result.get("sqlite_databases", 0), teams_result.get("keyword_hits", 0) + teams_result.get("text_hits", 0), deep_result.get("candidate_files", 0), deep_result.get("extracted_files", 0), deep_result.get("keyword_hits", 0), warnings)
+    elif "deep_scan" not in skip_stages:
+        run_control.skip("deep_scan", "stage_not_selected")
+
     system_flags = {
         "system_artifacts": bool(getattr(args, "system_artifacts", False)),
         "notification_scan": bool(getattr(args, "notification_scan", False)),
@@ -605,38 +727,103 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
         system_flags["microsoft_coredata_scan"] = system_flags["microsoft_coredata_scan"] or "microsoft-coredata" in focus_sources
         system_flags["raw_string_carve"] = system_flags["raw_string_carve"] or "raw" in focus_sources
         system_flags["sqlite_carve"] = system_flags["sqlite_carve"] or "sqlite-raw" in focus_sources
-    if any(system_flags.values()) or getattr(args, "compound_keyword", []):
-        system_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + args.keyword + case_terms))
-        compound_terms = list(getattr(args, "compound_keyword", []))
-        compound_terms.extend(f"{left},{right}" for left, right in case_targets.near_terms)
-        system_result = run_system_artifacts(
-            records,
-            extractor,
-            output,
-            system_keywords,
-            system_flags,
-            args.max_deep_file_mb,
-            args.include_large_deep_files,
-            args.deep_scan_text_limit_mb,
-            args.deep_scan_sqlite_row_limit,
-            args.deep_scan_export_context,
-            compound_terms,
-            getattr(args, "compound_window", 500),
-            warnings,
-        )
-        artifacts.extend(system_result.pop("artifacts", []))
-        log_lines.append("Ran system artefact scan")
+
+    if stage_enabled("system_artifacts") and (any(system_flags.values()) or getattr(args, "compound_keyword", [])):
+        run_control.start("system_artifacts")
+        try:
+            assert extractor is not None
+            system_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + args.keyword + case_terms))
+            compound_terms = [] if getattr(args, "disable_compound_review", False) else list(getattr(args, "compound_keyword", []))
+            if not getattr(args, "disable_compound_review", False):
+                compound_terms.extend(f"{left},{right}" for left, right in case_targets.near_terms)
+            system_result = run_system_artifacts(
+                records,
+                extractor,
+                output,
+                system_keywords,
+                system_flags,
+                args.max_deep_file_mb,
+                args.include_large_deep_files,
+                args.deep_scan_text_limit_mb,
+                args.deep_scan_sqlite_row_limit,
+                args.deep_scan_export_context,
+                compound_terms,
+                getattr(args, "compound_window", 500),
+                warnings,
+                getattr(args, "progress_every", 500),
+            )
+            artifacts.extend(system_result.pop("artifacts", []))
+            log_lines.append("Ran system artefact scan")
+            run_control.complete("system_artifacts", system_result)
+        except Exception as exc:
+            run_control.fail("system_artifacts", exc)
+            raise
+        if stop_if_requested("system_artifacts"):
+            return TriageResult(str(output), backup_encrypted, len(records), sum(1 for a in artifacts if a.extracted), sms_count, teams_result.get("candidate_files", 0), teams_result.get("sqlite_databases", 0), teams_result.get("keyword_hits", 0) + teams_result.get("text_hits", 0), deep_result.get("candidate_files", 0), deep_result.get("extracted_files", 0), deep_result.get("keyword_hits", 0), warnings)
+    elif "system_artifacts" not in skip_stages:
+        run_control.skip("system_artifacts", "stage_not_selected")
+
     include_photos = bool(getattr(args, "photo_candidate_scan", False) or "photos" in case_targets.focus_sources)
     include_screenshots = bool(getattr(args, "screenshot_candidate_scan", False) or "screenshots" in case_targets.focus_sources)
-    photo_result = write_photo_candidate_exports(output, records, include_photos, include_screenshots)
-    if include_photos or include_screenshots:
-        log_lines.append("Wrote photo/screenshot candidate reports")
-    if args.write_timeline:
-        _write_timeline(output)
-    review_result = write_review_exports(output, getattr(args, "compound_keyword", []), getattr(args, "compound_window", 500))
-    case_result = write_case_focus_exports(output, case_targets)
-    _write_evidence_manifest(output, artifacts)
-    log_lines.append("Wrote evidence manifest")
+    if stage_enabled("photos") and (include_photos or include_screenshots):
+        run_control.start("photos")
+        try:
+            photo_result = write_photo_candidate_exports(output, records, include_photos, include_screenshots)
+            log_lines.append("Wrote photo/screenshot candidate reports")
+            run_control.complete("photos", photo_result)
+        except Exception as exc:
+            run_control.fail("photos", exc)
+            raise
+        if stop_if_requested("photos"):
+            return TriageResult(str(output), backup_encrypted, len(records), sum(1 for a in artifacts if a.extracted), sms_count, teams_result.get("candidate_files", 0), teams_result.get("sqlite_databases", 0), teams_result.get("keyword_hits", 0) + teams_result.get("text_hits", 0), deep_result.get("candidate_files", 0), deep_result.get("extracted_files", 0), deep_result.get("keyword_hits", 0), warnings)
+    elif "photos" not in skip_stages:
+        run_control.skip("photos", "stage_not_selected")
+
+    if stage_enabled("timeline") and args.write_timeline:
+        run_control.start("timeline")
+        try:
+            _write_timeline(output)
+            run_control.complete("timeline", {"written": True})
+        except Exception as exc:
+            run_control.fail("timeline", exc)
+            raise
+    elif "timeline" not in skip_stages:
+        run_control.skip("timeline", "stage_not_selected")
+
+    if stage_enabled("review"):
+        run_control.start("review")
+        try:
+            review_result = write_review_exports(output, getattr(args, "compound_keyword", []), getattr(args, "compound_window", 500))
+            run_control.complete("review", review_result)
+        except Exception as exc:
+            run_control.fail("review", exc)
+            raise
+        if stop_if_requested("review"):
+            return TriageResult(str(output), backup_encrypted, len(records), sum(1 for a in artifacts if a.extracted), sms_count, teams_result.get("candidate_files", 0), teams_result.get("sqlite_databases", 0), teams_result.get("keyword_hits", 0) + teams_result.get("text_hits", 0), deep_result.get("candidate_files", 0), deep_result.get("extracted_files", 0), deep_result.get("keyword_hits", 0), warnings)
+
+    if stage_enabled("case_focus"):
+        run_control.start("case_focus")
+        try:
+            case_result = write_case_focus_exports(output, case_targets, getattr(args, "max_case_review_rows", 250))
+            run_control.complete("case_focus", case_result)
+        except Exception as exc:
+            run_control.fail("case_focus", exc)
+            raise
+        if stop_if_requested("case_focus"):
+            return TriageResult(str(output), backup_encrypted, len(records), sum(1 for a in artifacts if a.extracted), sms_count, teams_result.get("candidate_files", 0), teams_result.get("sqlite_databases", 0), teams_result.get("keyword_hits", 0) + teams_result.get("text_hits", 0), deep_result.get("candidate_files", 0), deep_result.get("extracted_files", 0), deep_result.get("keyword_hits", 0), warnings)
+
+    if stage_enabled("evidence_manifest"):
+        run_control.start("evidence_manifest")
+        try:
+            _write_evidence_manifest(output, artifacts)
+            log_lines.append("Wrote evidence manifest")
+            run_control.complete("evidence_manifest", {"artifacts": len(artifacts), "extracted": sum(1 for a in artifacts if a.extracted)})
+        except Exception as exc:
+            run_control.fail("evidence_manifest", exc)
+            raise
+    elif "evidence_manifest" not in skip_stages:
+        run_control.skip("evidence_manifest", "stage_not_selected")
+
     write_json(output / "warnings.json", warnings)
     summary = {
         "generated_utc": utc_now_iso(),
@@ -709,8 +896,17 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
             "Decrypt-size mismatch is warning-level until SQLite integrity checks or parser failures prove an extraction failure.",
         ],
     }
-    write_case_summary(output / "case_summary.json", output / "case_summary.html", summary)
-    log_lines.append("Wrote case summary")
+    if stage_enabled("case_summary"):
+        run_control.start("case_summary")
+        try:
+            write_case_summary(output / "case_summary.json", output / "case_summary.html", summary)
+            log_lines.append("Wrote case summary")
+            run_control.complete("case_summary", summary["results"])
+        except Exception as exc:
+            run_control.fail("case_summary", exc)
+            raise
+    elif "case_summary" not in skip_stages:
+        run_control.skip("case_summary", "stage_not_selected")
     _write_log(output, log_lines)
     log_ok(f"Forensic triage complete: {output}")
     return TriageResult(

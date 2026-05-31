@@ -16,6 +16,20 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid 
 th{background:#18181b}.keyword{color:#05f2af;font-weight:700}.warn{color:#fbbf24}.muted{color:#a1a1aa}.mag{color:#e20074}
 """
 MAX_HTML_BYTES = 25 * 1024 * 1024
+HTML_ENABLED = True
+MAX_REPORT_ROWS = 1000
+NO_LARGE_HTML = True
+
+
+def set_report_options(*, no_html: bool = False, csv_only: bool = False, no_large_html: bool = True, max_report_rows: int = 1000) -> None:
+    global HTML_ENABLED, MAX_REPORT_ROWS, NO_LARGE_HTML
+    HTML_ENABLED = not (no_html or csv_only)
+    MAX_REPORT_ROWS = max(0, int(max_report_rows))
+    NO_LARGE_HTML = bool(no_large_html)
+
+
+def get_max_report_rows() -> int:
+    return MAX_REPORT_ROWS
 
 
 def utc_now_iso() -> str:
@@ -52,13 +66,27 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]], fieldnames: list[str] 
 
 
 def write_table_html(path: Path, title: str, rows: Iterable[dict[str, Any]], intro: str = "") -> None:
+    if not HTML_ENABLED:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = [to_plain(r) for r in rows]
+    iterator = iter(rows)
+    first = next(iterator, None)
+    data: list[dict[str, Any]] = []
+    truncated = False
+    if first is not None:
+        data.append(to_plain(first))
+        for idx, row in enumerate(iterator, start=1):
+            if idx >= MAX_REPORT_ROWS:
+                truncated = True
+                break
+            data.append(to_plain(row))
     fields = list(data[0].keys()) if data else []
     parts = ["<!doctype html><meta charset='utf-8'>", f"<title>{html.escape(title)}</title>", f"<style>{CSS}</style>"]
     parts.append(f"<h1>{html.escape(title)}</h1>")
     if intro:
         parts.append(f"<div class='card'>{html.escape(intro)}</div>")
+    if truncated:
+        parts.append(f"<div class='card warn'>HTML truncated to {MAX_REPORT_ROWS} rows. Use CSV/JSON for the complete output.</div>")
     if not data:
         parts.append("<div class='card muted'>No records.</div>")
     else:
@@ -75,12 +103,14 @@ def write_table_html(path: Path, title: str, rows: Iterable[dict[str, Any]], int
     path.write_text("".join(parts), encoding="utf-8")
 
 
-def _cards_html(title: str, cards: list[dict[str, Any]], text_field: str) -> str:
+def _cards_html(title: str, cards: list[dict[str, Any]], text_field: str, truncated: bool = False) -> str:
     display_field = text_field
     if cards and any("clean_snippet" in card for card in cards):
         display_field = "clean_snippet"
     parts = ["<!doctype html><meta charset='utf-8'>", f"<title>{html.escape(title)}</title>", f"<style>{CSS}</style>"]
     parts.append(f"<h1>{html.escape(title)}</h1>")
+    if truncated:
+        parts.append(f"<div class='card warn'>HTML truncated to {MAX_REPORT_ROWS} rows. Use CSV/JSON for the complete output.</div>")
     for card in cards:
         parts.append("<div class='card'>")
         for key, value in to_plain(card).items():
@@ -98,9 +128,17 @@ def _cards_html(title: str, cards: list[dict[str, Any]], text_field: str) -> str
 
 
 def write_cards_html(path: Path, title: str, cards: Iterable[dict[str, Any]], text_field: str = "snippet") -> None:
+    if not HTML_ENABLED:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = [to_plain(card) for card in cards]
-    html_text = _cards_html(title, data, text_field)
+    data: list[dict[str, Any]] = []
+    truncated = False
+    for idx, card in enumerate(cards):
+        if idx >= MAX_REPORT_ROWS:
+            truncated = True
+            break
+        data.append(to_plain(card))
+    html_text = _cards_html(title, data, text_field, truncated=truncated)
     if len(html_text.encode("utf-8")) <= MAX_HTML_BYTES:
         path.write_text(html_text, encoding="utf-8")
         return
@@ -135,6 +173,8 @@ def write_cards_html(path: Path, title: str, cards: Iterable[dict[str, Any]], te
 
 def write_case_summary(path_json: Path, path_html: Path, summary: dict[str, Any]) -> None:
     write_json(path_json, summary)
+    if not HTML_ENABLED:
+        return
     parts = ["<!doctype html><meta charset='utf-8'>", "<title>Case Summary</title>", f"<style>{CSS}</style>", "<h1>Case Summary</h1>"]
     for section in ("device", "manifest", "results"):
         parts.append(f"<div class='card'><h2>{section.title()}</h2>")

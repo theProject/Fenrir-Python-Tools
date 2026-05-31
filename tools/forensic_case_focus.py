@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shlex
 from collections import Counter
@@ -11,7 +12,7 @@ from typing import Any
 
 from tools.forensic_common import guess_app_from_record_domain
 from tools.forensic_models import ManifestRecord
-from tools.forensic_reports import write_cards_html, write_csv, write_json, write_table_html
+from tools.forensic_reports import get_max_report_rows, write_cards_html, write_csv, write_json, write_table_html
 
 
 SUPPORTED_FOCUS_SOURCES = {
@@ -212,12 +213,26 @@ def source_files(output: Path) -> list[tuple[str, Path]]:
     ]
 
 
+def _csv_source_for_json(path: Path) -> Path:
+    return path.with_suffix(".csv")
+
+
 def _load_rows(path: Path) -> list[dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def iter_source_rows(path: Path) -> Any:
+    csv_path = _csv_source_for_json(path)
+    if csv_path.exists():
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            yield from csv.DictReader(f)
+        return
+    for row in _load_rows(path):
+        yield row
 
 
 def _search_blob(row: dict[str, Any]) -> str:
@@ -325,7 +340,7 @@ def collect_case_hits(output: Path, targets: CaseTargets) -> list[dict[str, Any]
     for source, path in source_files(output):
         if focus and source not in focus and not (source == "deep" and "raw" in focus):
             continue
-        for row in _load_rows(path):
+        for row in iter_source_rows(path):
             scored = score_case_hit(row, targets, source)
             if scored:
                 hits.append(scored)
@@ -345,33 +360,103 @@ def _summary(rows: list[dict[str, Any]], key: str, value_name: str) -> list[dict
     return [{value_name: value, "hits": count} for value, count in counts.most_common()]
 
 
-def write_case_focus_exports(output: Path, targets: CaseTargets) -> dict[str, int]:
+def _bump_counter(counter: Counter[str], value: str) -> None:
+    if ";" in value:
+        for part in [p for p in value.split(";") if p]:
+            counter[part] += 1
+    else:
+        counter[value or "unknown"] += 1
+
+
+def _summary_from_counter(counter: Counter[str], value_name: str) -> list[dict[str, Any]]:
+    return [{value_name: value, "hits": count} for value, count in counter.most_common()]
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+
+def _insert_review_candidate(queue: list[dict[str, Any]], row: dict[str, Any], limit: int) -> None:
+    if limit <= 0:
+        return
+    queue.append(dict(row))
+    queue.sort(key=lambda item: (-int(item.get("score") or 0), item.get("case_datetime_utc") or "9999"))
+    del queue[limit:]
+
+
+def write_case_focus_exports(output: Path, targets: CaseTargets, max_review_rows: int = 250) -> dict[str, int]:
     if not targets.enabled:
         return {"case_hits": 0}
     outdir = output / "case_focus"
-    rows = collect_case_hits(output, targets)
-    write_csv(outdir / "case_hits.csv", rows)
-    write_json(outdir / "case_hits.json", rows)
-    write_cards_html(outdir / "case_hits.html", "Case Focus Hits", rows, text_field="clean_snippet")
+    outdir.mkdir(parents=True, exist_ok=True)
+    case_hits_path = outdir / "case_hits.csv"
+    jsonl_path = outdir / "case_hits.jsonl"
+    source_counter: Counter[str] = Counter()
+    term_counter: Counter[str] = Counter()
+    person_counter: Counter[str] = Counter()
+    email_counter: Counter[str] = Counter()
+    date_counter: Counter[str] = Counter()
+    review_queue: list[dict[str, Any]] = []
+    json_rows: list[dict[str, Any]] = []
+    html_rows: list[dict[str, Any]] = []
+    timeline_rows: list[dict[str, Any]] = []
+    max_report_rows = get_max_report_rows()
+    writer: csv.DictWriter[str] | None = None
+    count = 0
+    focus = set(targets.focus_sources)
+    with case_hits_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as jsonl_file:
+        for source, path in source_files(output):
+            if focus and source not in focus and not (source == "deep" and "raw" in focus):
+                continue
+            for row in iter_source_rows(path):
+                scored = score_case_hit(row, targets, source)
+                if not scored:
+                    continue
+                if writer is None:
+                    writer = csv.DictWriter(csv_file, fieldnames=list(scored.keys()), extrasaction="ignore")
+                    writer.writeheader()
+                writer.writerow(scored)
+                jsonl_file.write(json.dumps(scored, ensure_ascii=False, default=str) + "\n")
+                count += 1
+                source_counter[scored.get("case_source") or "unknown"] += 1
+                _bump_counter(term_counter, str(scored.get("matched_terms") or "unknown"))
+                _bump_counter(person_counter, str(scored.get("matched_people") or "unknown"))
+                _bump_counter(email_counter, str(scored.get("matched_emails") or "unknown"))
+                date_counter[(scored.get("case_datetime_utc") or "undated")[:10] if scored.get("case_datetime_utc") else "undated"] += 1
+                _insert_review_candidate(review_queue, scored, max_review_rows)
+                if len(json_rows) <= max_report_rows:
+                    json_rows.append(dict(scored))
+                if len(html_rows) < max_report_rows:
+                    html_rows.append(dict(scored))
+                if scored.get("case_datetime_utc") and len(timeline_rows) < max_report_rows:
+                    timeline_rows.append(dict(scored))
+        if writer is None:
+            csv_file.write("")
+    if count <= max_report_rows:
+        write_json(outdir / "case_hits.json", json_rows)
+    else:
+        (outdir / "case_hits.json").unlink(missing_ok=True)
+    write_cards_html(outdir / "case_hits.html", "Case Focus Hits", html_rows, text_field="clean_snippet")
     summaries = {
-        "case_hits_by_source": _summary(rows, "case_source", "source"),
-        "case_hits_by_term": _summary(rows, "matched_terms", "term"),
-        "case_hits_by_person": _summary(rows, "matched_people", "person"),
-        "case_hits_by_email": _summary(rows, "matched_emails", "email"),
-        "case_hits_by_date": _summary([{**row, "case_date": (row.get("case_datetime_utc") or "undated")[:10] if row.get("case_datetime_utc") else "undated"} for row in rows], "case_date", "date"),
+        "case_hits_by_source": _summary_from_counter(source_counter, "source"),
+        "case_hits_by_term": _summary_from_counter(term_counter, "term"),
+        "case_hits_by_person": _summary_from_counter(person_counter, "person"),
+        "case_hits_by_email": _summary_from_counter(email_counter, "email"),
+        "case_hits_by_date": _summary_from_counter(date_counter, "date"),
     }
     for stem, summary_rows in summaries.items():
         write_csv(outdir / f"{stem}.csv", summary_rows)
         write_json(outdir / f"{stem}.json", summary_rows)
         write_table_html(outdir / f"{stem}.html", stem.replace("_", " ").title(), summary_rows)
-    timeline = [row for row in rows if row.get("case_datetime_utc")]
-    timeline.sort(key=lambda row: row["case_datetime_utc"])
-    write_csv(outdir / "case_timeline.csv", timeline)
-    write_table_html(outdir / "case_timeline.html", "Case Timeline", timeline)
-    review_queue = rows[:250]
+    timeline_rows.sort(key=lambda row: row["case_datetime_utc"])
+    write_csv(outdir / "case_timeline.csv", timeline_rows)
+    write_table_html(outdir / "case_timeline.html", "Case Timeline", timeline_rows)
     write_csv(outdir / "review_queue.csv", review_queue)
     write_table_html(outdir / "review_queue.html", "Case Review Queue", review_queue)
-    return {"case_hits": len(rows), "case_review_queue": len(review_queue)}
+    return {"case_hits": count, "case_review_queue": len(review_queue)}
 
 
 def _photo_reason(record: ManifestRecord) -> str | None:
@@ -574,6 +659,21 @@ def run_investigate(args: argparse.Namespace) -> list[str]:
             "sqlite_carve": False,
             "compound_keyword": [],
             "compound_window": 500,
+            "disable_compound_review": False,
+            "only_stage": None,
+            "skip_stage": [],
+            "stop_after_stage": None,
+            "case_focus_only": False,
+            "review_only": False,
+            "summary_only": False,
+            "resume": False,
+            "skip_existing_extractions": False,
+            "csv_only": False,
+            "no_html": False,
+            "no_large_html": True,
+            "max_report_rows": 1000,
+            "max_case_review_rows": 250,
+            "progress_every": 500,
         }
         for key, value in defaults.items():
             if not hasattr(forensic_args, key):

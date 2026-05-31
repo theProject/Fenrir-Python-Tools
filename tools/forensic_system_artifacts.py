@@ -531,6 +531,7 @@ def run_system_artifacts(
     compound_keywords: list[str],
     compound_window: int,
     warnings: list[str],
+    progress_every: int = 500,
 ) -> dict[str, Any]:
     outdir = output / "system_artifacts"
     extracted_dir = outdir / "extracted_files"
@@ -555,8 +556,11 @@ def run_system_artifacts(
     coredata_enabled = flags.get("system_artifacts") or flags.get("microsoft_coredata_scan")
     if not (enabled or raw_enabled or sqlite_carve_enabled or coredata_enabled or compound_keywords):
         return {"artifacts": []}
+    track_compound = bool(compound_keywords)
     all_hits_for_compound: list[dict[str, Any]] = []
-    for record in records:
+    for record_number, record in enumerate(records, start=1):
+        if progress_every > 0 and record_number % progress_every == 0:
+            print(f"system_artifacts scanned manifest records: {record_number}", flush=True)
         categories = categories_for_record(record, enabled)
         logical = _logical(record)
         microsoft_candidate = "microsoft" in logical or "office" in logical or "sharepoint" in logical or "outlook" in logical
@@ -704,7 +708,8 @@ def run_system_artifacts(
             try:
                 hits = scan_artifact_keywords(actual_path, record, scan_keywords, evidence_class, f"{category}_scan", sqlite_row_limit, context)
                 category_hits[category].extend(hits)
-                all_hits_for_compound.extend(hits)
+                if track_compound:
+                    all_hits_for_compound.extend(hits)
             except Exception as exc:
                 message = f"Could not inspect system artefact {record.logical_path}: {exc}"
                 warnings.append(message)
@@ -715,7 +720,8 @@ def run_system_artifacts(
                 core_person_hits.extend(person_hits)
                 core_related_rows.extend(related)
                 core_schema_rows.extend(schema)
-                all_hits_for_compound.extend(person_hits)
+                if track_compound:
+                    all_hits_for_compound.extend(person_hits)
             except Exception as exc:
                 message = f"Could not inspect Microsoft CoreData database {record.logical_path}: {exc}"
                 warnings.append(message)
@@ -724,7 +730,8 @@ def run_system_artifacts(
             try:
                 hits = raw_string_carve(actual_path, record, keywords, context)
                 raw_hits.extend(hits)
-                all_hits_for_compound.extend(hits)
+                if track_compound:
+                    all_hits_for_compound.extend(hits)
             except Exception as exc:
                 message = f"Could not raw-string carve {record.logical_path}: {exc}"
                 warnings.append(message)
@@ -733,7 +740,8 @@ def run_system_artifacts(
             try:
                 hits = sqlite_raw_byte_carve(actual_path, record, keywords, context)
                 sqlite_raw_hits.extend(hits)
-                all_hits_for_compound.extend(hits)
+                if track_compound:
+                    all_hits_for_compound.extend(hits)
             except Exception as exc:
                 message = f"Could not SQLite raw-byte carve {record.logical_path}: {exc}"
                 warnings.append(message)
