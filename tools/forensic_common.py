@@ -18,7 +18,22 @@ SECRET_RE = re.compile(
     r"(\s*[:=]\s*|[\"']\s*:\s*[\"']?)([^,\s\"';&}{]{8,})"
 )
 DIRECTORY_MODE = 0o040000
+REGULAR_FILE_MODE = 0o100000
 FILE_TYPE_MASK = 0o170000
+KNOWN_FILE_EXTENSIONS = {
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".json",
+    ".plist",
+    ".txt",
+    ".log",
+    ".ldb",
+    ".sst",
+    ".xml",
+    ".html",
+    ".htm",
+}
 CONTAINER_PATH_SUFFIXES = {
     "Library/HTTPStorages",
     "Library/WebKit/Databases",
@@ -29,6 +44,32 @@ CONTAINER_PATH_SUFFIXES = {
     "WebKit",
     "WebsiteData",
 }
+KNOWN_CONTAINER_NAMES = {
+    "httpstorages",
+    "indexeddb",
+    "localstorage",
+    "databases",
+    "websitedata",
+    "webkit",
+    "sitesservicecache",
+    "backstageinappnavcache",
+    "resourceinfocache",
+    "webservicecache",
+    "mruservicecache",
+    "localcacheroot",
+    "sharedlogs",
+    "attachmentstorage",
+    "streamcache",
+    "logs",
+}
+CONTAINER_PARENT_NAMES = {
+    "sitesservicecache",
+    "backstageinappnavcache",
+    "resourceinfocache",
+    "webservicecache",
+    "mruservicecache",
+}
+HEX_BASENAME_RE = re.compile(r"^[0-9a-fA-F]{32,}$")
 
 
 def sha256_file(path: Path) -> str:
@@ -142,19 +183,46 @@ def metadata_indicates_directory(metadata: dict[str, Any]) -> bool:
     return bool(mode is not None and (mode & FILE_TYPE_MASK) == DIRECTORY_MODE)
 
 
+def metadata_indicates_regular_file(metadata: dict[str, Any]) -> bool:
+    if not metadata:
+        return False
+    for key in ("file_type", "FileType", "type", "Type", "NSFileType"):
+        value = str(metadata.get(key, "")).lower()
+        if "regular" in value or value == "file" or value.endswith("file"):
+            return True
+    mode = _metadata_mode(metadata)
+    return bool(mode is not None and (mode & FILE_TYPE_MASK) == REGULAR_FILE_MODE)
+
+
+def _has_known_file_extension(path: str) -> bool:
+    return Path(path).suffix.lower() in KNOWN_FILE_EXTENSIONS
+
+
 def is_likely_directory_record(domain: str, relative_path: str, metadata: dict[str, Any] | None = None) -> bool:
-    if metadata_indicates_directory(metadata or {}):
+    metadata = metadata or {}
+    if metadata_indicates_regular_file(metadata):
+        return False
+    if metadata_indicates_directory(metadata):
         return True
     normalized = str(Path(relative_path).as_posix()).strip("/")
     if not normalized:
         return True
+    if _has_known_file_extension(normalized):
+        return False
     normalized_lower = normalized.lower()
     for suffix in CONTAINER_PATH_SUFFIXES:
         suffix_lower = suffix.lower()
         if normalized_lower == suffix_lower or normalized_lower.endswith(f"/{suffix_lower}"):
             return True
-    leaf = Path(normalized).name.lower()
-    return leaf in {"webkit", "websitedata"}
+    parts = [part.lower() for part in Path(normalized).parts]
+    leaf = parts[-1] if parts else ""
+    if leaf in KNOWN_CONTAINER_NAMES:
+        return True
+    if any(parent in parts[:-1] for parent in CONTAINER_PARENT_NAMES):
+        return True
+    if HEX_BASENAME_RE.match(leaf) and any(parent in parts for parent in {"indexeddb", "localstorage"}):
+        return True
+    return False
 
 
 def keyword_hits(text: str, keywords: list[str], context: int = 120) -> list[tuple[str, int, str]]:

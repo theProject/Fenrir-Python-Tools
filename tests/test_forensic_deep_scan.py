@@ -4,6 +4,7 @@ import sqlite3
 
 from tools.forensic_backup import BackupExtractor
 from tools.forensic_backup import add_forensic_parser
+from tools.forensic_common import is_likely_directory_record
 from tools.forensic_deep_scan import DEFAULT_DEEP_KEYWORDS, is_deep_candidate, run_deep_scan
 from tools.forensic_models import ManifestRecord
 from tools.forensic_teams import inspect_sqlite_keywords, scan_text_keywords
@@ -112,3 +113,73 @@ def test_deep_scan_extensionless_candidate_still_extracts_and_scans(tmp_path):
     assert result["directory_records_skipped"] == 0
     assert result["keyword_hits"] == 1
     assert warnings == []
+
+
+def test_milestone_1_1_known_container_warning_paths_are_skipped():
+    paths = [
+        (
+            "AppDomain-com.microsoft.Office.Word",
+            "Library/Application Support/Microsoft/Office/16.0/SitesServiceCache",
+        ),
+        (
+            "AppDomain-com.microsoft.Office.Word",
+            "Library/Application Support/Microsoft/Office/16.0/MruServiceCache/UnsignedUser",
+        ),
+        (
+            "AppDomain-com.microsoft.Office.Outlook",
+            "Library/WebKit/WebsiteData/Default/ABCDEF1234567890/ABCDEF1234567890/LocalStorage",
+        ),
+        (
+            "AppDomain-com.microsoft.sharepoint",
+            "Library/WebKit/WebsiteData/Default/ABCDEF1234567890/ABCDEF1234567890/IndexedDB",
+        ),
+        ("AppDomain-com.microsoft.sharepoint", "Library/localCacheRoot"),
+        ("AppDomainGroup-group.com.microsoft.sharepoint", "sharedlogs"),
+        ("AppDomain-com.microsoft.copilot", "Library/Application Support/AttachmentStorage"),
+        ("AppDomainPlugin-com.microsoft.skydrive.onedrivefileprovider", "Library/StreamCache"),
+        ("AppDomainGroup-group.com.microsoft.onenote", "ShareExtension/Logs"),
+        (
+            "AppDomain-com.microsoft.Office.Word",
+            "Library/Application Support/Microsoft/Office/16.0/BackstageInAppNavCache",
+        ),
+        (
+            "AppDomain-com.microsoft.Office.Word",
+            "Library/Application Support/Microsoft/Office/16.0/ResourceInfoCache",
+        ),
+        (
+            "AppDomain-com.microsoft.Office.Word",
+            "Library/Application Support/Microsoft/Office/16.0/WebServiceCache",
+        ),
+    ]
+
+    for domain, relative_path in paths:
+        assert is_likely_directory_record(domain, relative_path), relative_path
+
+
+def test_milestone_1_1_clear_files_below_containers_are_not_skipped():
+    paths = [
+        ("AppDomain-com.example.app", "Library/Caches/user"),
+        (
+            "AppDomain-com.microsoft.Office.Outlook",
+            "Library/WebKit/WebsiteData/Default/foo/LocalStorage/leveldb/000003.log",
+        ),
+        (
+            "AppDomain-com.microsoft.sharepoint",
+            "Library/WebKit/WebsiteData/Default/foo/IndexedDB/blob.sqlite",
+        ),
+        ("AppDomain-com.microsoft.sharepoint", "Library/localCacheRoot/somefile.json"),
+    ]
+
+    for domain, relative_path in paths:
+        assert not is_likely_directory_record(domain, relative_path), relative_path
+
+
+def test_milestone_1_1_hash_like_extensionless_indexeddb_child_is_skipped_unless_file_metadata():
+    path = "Library/WebKit/WebsiteData/Default/foo/IndexedDB/0123456789abcdef0123456789ABCDEF"
+
+    assert is_likely_directory_record("AppDomain-com.microsoft.sharepoint", path)
+    assert not is_likely_directory_record(
+        "AppDomain-com.microsoft.sharepoint",
+        path,
+        {"Mode": 0o100644},
+    )
