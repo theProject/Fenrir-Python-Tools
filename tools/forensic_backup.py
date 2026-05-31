@@ -21,6 +21,7 @@ from tools.forensic_models import ExtractedArtifact, ForensicError, ManifestReco
 from tools.forensic_reports import utc_now_iso, write_case_summary, write_csv, write_json, write_table_html
 from tools.forensic_reports import write_cards_html
 from tools.forensic_sms import extract_sms_artifacts, parse_sms_exports
+from tools.forensic_system_artifacts import compound_keyword_hits, run_system_artifacts
 from tools.forensic_teams import run_teams_triage
 
 
@@ -50,6 +51,18 @@ def add_forensic_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--deep-scan-sqlite-row-limit", type=int, default=0, help="Rows per SQLite text column to scan; 0 means no row limit")
     p.add_argument("--deep-scan-export-context", type=int, default=240, help="Characters of context on each side of a deep-scan keyword hit")
     p.add_argument("--write-timeline", action="store_true")
+    p.add_argument("--system-artifacts", action="store_true")
+    p.add_argument("--notification-scan", action="store_true")
+    p.add_argument("--mail-scan", action="store_true")
+    p.add_argument("--keyboard-scan", action="store_true")
+    p.add_argument("--outlook-scan", action="store_true")
+    p.add_argument("--chrome-scan", action="store_true")
+    p.add_argument("--tesla-app-scan", action="store_true")
+    p.add_argument("--microsoft-coredata-scan", action="store_true")
+    p.add_argument("--raw-string-carve", action="store_true")
+    p.add_argument("--sqlite-carve", action="store_true")
+    p.add_argument("--compound-keyword", action="append", default=[])
+    p.add_argument("--compound-window", type=int, default=500)
 
 
 def get_password(args: argparse.Namespace) -> str | None:
@@ -333,10 +346,19 @@ def _hit_sources(output: Path) -> list[Path]:
         output / "teams" / "teams_keyword_hits.json",
         output / "teams" / "teams_text_keyword_hits.json",
         output / "deep_scan" / "deep_keyword_hits.json",
+        output / "system_artifacts" / "notification_keyword_hits.json",
+        output / "system_artifacts" / "mail_keyword_hits.json",
+        output / "system_artifacts" / "outlook_keyword_hits.json",
+        output / "system_artifacts" / "chrome_keyword_hits.json",
+        output / "system_artifacts" / "tesla_app_keyword_hits.json",
+        output / "system_artifacts" / "keyboard_keyword_hits.json",
+        output / "system_artifacts" / "raw_string_hits.json",
+        output / "system_artifacts" / "sqlite_raw_hits.json",
+        output / "microsoft_coredata" / "person_hits.json",
     ]
 
 
-def write_review_exports(output: Path) -> dict[str, int]:
+def write_review_exports(output: Path, compound_keywords: list[str] | None = None, compound_window: int = 500) -> dict[str, int]:
     hits: list[dict[str, Any]] = []
     for path in _hit_sources(output):
         hits.extend(plist_safe_json(path))
@@ -368,7 +390,11 @@ def write_review_exports(output: Path) -> dict[str, int]:
     write_csv(review_dir / "app_domain_summary.csv", app_rows)
     write_json(review_dir / "app_domain_summary.json", app_rows)
     write_table_html(review_dir / "app_domain_summary.html", "App / Domain Summary", app_rows)
-    return {"high_signal_hits": len(high_signal), "reviewed_hits": len(hits)}
+    compound_rows = compound_keyword_hits(hits, compound_keywords or [], compound_window)
+    write_csv(review_dir / "compound_keyword_hits.csv", compound_rows)
+    write_json(review_dir / "compound_keyword_hits.json", compound_rows)
+    write_cards_html(review_dir / "compound_keyword_hits.html", "Compound Keyword Hits", compound_rows)
+    return {"high_signal_hits": len(high_signal), "reviewed_hits": len(hits), "compound_keyword_hits": len(compound_rows)}
 
 
 def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
@@ -393,6 +419,7 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
     sms_count = 0
     teams_result: dict[str, Any] = {"candidate_files": 0, "sqlite_databases": 0, "keyword_hits": 0, "text_hits": 0}
     deep_result: dict[str, Any] = {"candidate_files": 0, "extracted_files": 0, "keyword_hits": 0, "skipped_files": 0, "sqlite_databases": 0, "text_files": 0}
+    system_result: dict[str, Any] = {}
     targets = set(args.targets)
     if targets.intersection({"sms", "messages", "imessage"}):
         sms_artifacts, sms_warnings = extract_sms_artifacts(records, index, extractor, output, include_attachments=not args.no_attachments)
@@ -423,9 +450,40 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
         )
         artifacts.extend(deep_result.pop("artifacts"))
         log_lines.append("Ran deep app cache scan")
+    system_flags = {
+        "system_artifacts": bool(getattr(args, "system_artifacts", False)),
+        "notification_scan": bool(getattr(args, "notification_scan", False)),
+        "mail_scan": bool(getattr(args, "mail_scan", False)),
+        "keyboard_scan": bool(getattr(args, "keyboard_scan", False)),
+        "outlook_scan": bool(getattr(args, "outlook_scan", False)),
+        "chrome_scan": bool(getattr(args, "chrome_scan", False)),
+        "tesla_app_scan": bool(getattr(args, "tesla_app_scan", False)),
+        "microsoft_coredata_scan": bool(getattr(args, "microsoft_coredata_scan", False)),
+        "raw_string_carve": bool(getattr(args, "raw_string_carve", False)),
+        "sqlite_carve": bool(getattr(args, "sqlite_carve", False)),
+    }
+    if any(system_flags.values()) or getattr(args, "compound_keyword", []):
+        system_keywords = list(dict.fromkeys(DEFAULT_DEEP_KEYWORDS + args.deep_keyword + args.keyword))
+        system_result = run_system_artifacts(
+            records,
+            extractor,
+            output,
+            system_keywords,
+            system_flags,
+            args.max_deep_file_mb,
+            args.include_large_deep_files,
+            args.deep_scan_text_limit_mb,
+            args.deep_scan_sqlite_row_limit,
+            args.deep_scan_export_context,
+            getattr(args, "compound_keyword", []),
+            getattr(args, "compound_window", 500),
+            warnings,
+        )
+        artifacts.extend(system_result.pop("artifacts", []))
+        log_lines.append("Ran system artefact scan")
     if args.write_timeline:
         _write_timeline(output)
-    review_result = write_review_exports(output)
+    review_result = write_review_exports(output, getattr(args, "compound_keyword", []), getattr(args, "compound_window", 500))
     _write_evidence_manifest(output, artifacts)
     log_lines.append("Wrote evidence manifest")
     write_json(output / "warnings.json", warnings)
@@ -464,8 +522,19 @@ def run_forensic_triage(args: argparse.Namespace) -> TriageResult:
             "deep_scan_sqlite_row_limit": deep_result.get("sqlite_row_limit", args.deep_scan_sqlite_row_limit),
             "deep_scan_export_context": deep_result.get("export_context", args.deep_scan_export_context),
             "high_signal_hits": review_result.get("high_signal_hits", 0),
-            "directory_records_skipped": teams_result.get("directory_records_skipped", 0) + deep_result.get("directory_records_skipped", 0),
-            "extraction_failures": teams_result.get("extraction_failures", 0) + deep_result.get("extraction_failures", 0),
+            "notification_hits": system_result.get("notification_hits", 0),
+            "mail_hits": system_result.get("mail_hits", 0),
+            "outlook_hits": system_result.get("outlook_hits", 0),
+            "chrome_hits": system_result.get("chrome_hits", 0),
+            "tesla_app_hits": system_result.get("tesla_app_hits", 0),
+            "keyboard_hits": system_result.get("keyboard_hits", 0),
+            "microsoft_coredata_person_hits": system_result.get("microsoft_coredata_person_hits", 0),
+            "microsoft_coredata_related_rows": system_result.get("microsoft_coredata_related_rows", 0),
+            "raw_string_hits": system_result.get("raw_string_hits", 0),
+            "sqlite_raw_hits": system_result.get("sqlite_raw_hits", 0),
+            "compound_keyword_hits": review_result.get("compound_keyword_hits", system_result.get("compound_keyword_hits", 0)),
+            "directory_records_skipped": teams_result.get("directory_records_skipped", 0) + deep_result.get("directory_records_skipped", 0) + system_result.get("directory_records_skipped", 0),
+            "extraction_failures": teams_result.get("extraction_failures", 0) + deep_result.get("extraction_failures", 0) + system_result.get("extraction_failures", 0),
         },
         "warnings": warnings,
         "notes": [
